@@ -2,7 +2,8 @@
 
 use crate::{PSN_MODULUS, Psn, PsnOrdering};
 
-const MAX_OUTSTANDING_PACKETS: u32 = (PSN_MODULUS / 2) - 1;
+/// Maximum unambiguous number of outstanding packets in the 24-bit PSN space.
+pub const MAX_OUTSTANDING_PACKETS: u32 = (PSN_MODULUS / 2) - 1;
 
 /// Result of processing a cumulative ACK.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,9 +63,18 @@ impl ReceivePsn {
 
     /// Classify a PSN and advance state for an in-order packet.
     pub fn observe(&mut self, received: Psn) -> ReceiveDisposition {
+        self.observe_span(received, 1)
+    }
+
+    /// Classify a PSN and advance by an accepted packet span.
+    ///
+    /// RDMA READ requests consume the PSN range occupied by their response
+    /// packets even though the request itself is a single packet. Callers must
+    /// pass at least one packet. A zero span is classified but never advances.
+    pub fn observe_span(&mut self, received: Psn, packets: u32) -> ReceiveDisposition {
         let disposition = self.classify(received);
-        if matches!(disposition, ReceiveDisposition::Expected) {
-            self.expected = self.expected.next();
+        if matches!(disposition, ReceiveDisposition::Expected) && packets != 0 {
+            self.expected = self.expected.wrapping_add(packets);
         }
         disposition
     }
@@ -116,12 +126,24 @@ impl SendWindow {
 
     /// Reserve and return the next PSN, or `None` if the safe window is full.
     pub fn reserve(&mut self) -> Option<Psn> {
-        if self.outstanding() >= MAX_OUTSTANDING_PACKETS {
+        self.reserve_many(1)
+    }
+
+    /// Reserve a contiguous PSN range and return its first PSN.
+    ///
+    /// A zero-length range is rejected. This operation is atomic: on failure
+    /// the window is unchanged. RDMA READ uses this to reserve every response
+    /// PSN before emitting the single read request.
+    pub fn reserve_many(&mut self, packets: u32) -> Option<Psn> {
+        if packets == 0
+            || packets > MAX_OUTSTANDING_PACKETS
+            || self.outstanding() > MAX_OUTSTANDING_PACKETS - packets
+        {
             return None;
         }
 
         let reserved = self.next_to_send;
-        self.next_to_send = self.next_to_send.next();
+        self.next_to_send = self.next_to_send.wrapping_add(packets);
         Some(reserved)
     }
 
@@ -224,5 +246,28 @@ mod tests {
             window.acknowledge(Psn::new(7).unwrap()),
             AckAdvance::Invalid
         );
+    }
+
+    #[test]
+    fn reserves_read_response_psn_span_atomically() {
+        let mut window = SendWindow::new(Psn::new(100).unwrap());
+        assert_eq!(window.reserve_many(4), Psn::new(100));
+        assert_eq!(window.next_to_send(), Psn::new(104).unwrap());
+        assert_eq!(window.outstanding(), 4);
+
+        let snapshot = window;
+        assert_eq!(window.reserve_many(0), None);
+        assert_eq!(window.reserve_many(MAX_OUTSTANDING_PACKETS), None);
+        assert_eq!(window, snapshot);
+    }
+
+    #[test]
+    fn read_request_advances_receive_psn_by_response_span() {
+        let mut receive = ReceivePsn::new(Psn::new(50).unwrap());
+        assert_eq!(
+            receive.observe_span(Psn::new(50).unwrap(), 3),
+            ReceiveDisposition::Expected
+        );
+        assert_eq!(receive.expected(), Psn::new(53).unwrap());
     }
 }
