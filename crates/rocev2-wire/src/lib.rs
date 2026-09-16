@@ -1,8 +1,8 @@
 //! `RoCEv2` wire-format support.
 //!
 //! This crate is dependency-free and `no_std`. It parses and encodes the
-//! InfiniBand transport headers carried by a `RoCEv2` UDP datagram, and computes
-//! the invariant CRC (ICRC) used by RoCE.
+//! `InfiniBand` transport headers carried by a `RoCEv2` UDP datagram, and computes
+//! the invariant CRC (ICRC) used by `RoCE`.
 //!
 //! The parser never dereferences packet-provided addresses and never allocates.
 

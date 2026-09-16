@@ -10,7 +10,7 @@ const QPN_RESERVED_MASK: u32 = 0x3f00_0000;
 const ACK_MASK: u32 = 0x8000_0000;
 const APSN_RESERVED_MASK: u32 = 0x7f00_0000;
 
-/// InfiniBand Base Transport Header carried by `RoCEv2`.
+/// `InfiniBand` Base Transport Header carried by `RoCEv2`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 // The booleans model independent one-bit BTH wire fields exactly.
 #[allow(clippy::struct_excessive_bools)]
@@ -25,7 +25,7 @@ pub struct Bth {
     pub pad_count: u8,
     /// Transport Header Version; currently required to be zero.
     pub transport_version: u8,
-    /// Partition key. RoCE data QPs normally use `0xffff`.
+    /// Partition key. `RoCE` data QPs normally use `0xffff`.
     pub partition_key: u16,
     /// Forward ECN bit.
     pub fecn: bool,
@@ -40,7 +40,7 @@ pub struct Bth {
 }
 
 impl Bth {
-    /// Default full-membership partition key used by RoCE.
+    /// Default full-membership partition key used by `RoCE`.
     pub const DEFAULT_PKEY: u16 = 0xffff;
 
     /// Construct a conventional RC BTH.

@@ -60,6 +60,15 @@ pub enum ApiError {
     ArithmeticOverflow,
     /// The fixed-capacity queue-pair table is full.
     QpTableFull,
+    /// The fixed-capacity QPN index cannot support the configured QP count.
+    InvalidQpnIndexCapacity {
+        /// Maximum number of live queue pairs.
+        qp_capacity: usize,
+        /// Number of entries in the QPN index.
+        index_capacity: usize,
+    },
+    /// The QPN index is unexpectedly full.
+    QpnIndexFull,
     /// A queue-pair handle is unknown, stale, or out of range.
     InvalidQpHandle,
     /// A local queue-pair number is already registered.
@@ -136,6 +145,14 @@ impl fmt::Display for ApiError {
             ),
             Self::ArithmeticOverflow => formatter.write_str("packet-length arithmetic overflow"),
             Self::QpTableFull => formatter.write_str("queue-pair table is full"),
+            Self::InvalidQpnIndexCapacity {
+                qp_capacity,
+                index_capacity,
+            } => write!(
+                formatter,
+                "QPN index capacity {index_capacity} must be a power of two and at least twice QP capacity {qp_capacity}"
+            ),
+            Self::QpnIndexFull => formatter.write_str("QPN index is full"),
             Self::InvalidQpHandle => formatter.write_str("invalid or stale queue-pair handle"),
             Self::DuplicateLocalQpn(qpn) => {
                 write!(formatter, "local queue-pair number {qpn} is already in use")

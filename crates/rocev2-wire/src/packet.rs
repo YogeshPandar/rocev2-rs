@@ -23,7 +23,7 @@ impl Default for ParseOptions {
     }
 }
 
-/// Borrowed, decoded RoCE transport packet.
+/// Borrowed, decoded `RoCE` transport packet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PacketRef<'a> {
     /// Base Transport Header.

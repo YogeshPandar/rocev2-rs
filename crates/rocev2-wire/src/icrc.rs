@@ -2,18 +2,18 @@ use crate::{BTH_LEN, WireError};
 
 /// ICRC field length.
 pub const ICRC_LEN: usize = 4;
-/// RoCE ICRC seed after the synthetic all-ones LRH contribution.
+/// `RoCE` ICRC seed after the synthetic all-ones LRH contribution.
 pub const ICRC_SEED: u32 = 0xdebb_20e3;
 const CRC32_POLYNOMIAL_REFLECTED: u32 = 0xedb8_8320;
 
-/// Incremental reflected CRC-32 used by the RoCE invariant CRC.
+/// Incremental reflected CRC-32 used by the `RoCE` invariant CRC.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Icrc {
     state: u32,
 }
 
 impl Icrc {
-    /// Start a RoCE ICRC calculation with the Annex A16/A17 seed.
+    /// Start a `RoCE` ICRC calculation with the Annex A16/A17 seed.
     #[must_use]
     pub const fn new() -> Self {
         Self { state: ICRC_SEED }

@@ -1,8 +1,7 @@
 //! Queue-pair configuration and state transitions.
 
-use crate::Psn;
+use crate::{Psn, qpn::MAX_QPN};
 
-const MAX_QPN: u32 = 0x00ff_ffff;
 const MIN_APPLICATION_QPN: u32 = 2;
 const MAX_RETRY_COUNT: u8 = 7;
 const MAX_TIMEOUT_CODE: u8 = 31;

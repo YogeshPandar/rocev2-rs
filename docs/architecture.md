@@ -8,12 +8,12 @@ memory safety and operating-system I/O:
 - `rocev2-wire`: dependency-free `no_std` BTH/RETH/AETH, IPv4/UDP, packet parser,
   encoder and ICRC. It borrows payloads and never allocates.
 - `rocev2-core`: `no_std` PSN arithmetic, QP transitions, segmentation, ACK
-  windows, retry policy and fixed-capacity rings.
+  windows, retry policy, fixed-capacity rings and local-QPN indexing.
 - `rocev2-memory`: registered-memory ownership, generation-tagged lkey/rkey,
   permission/range/overflow checks and a two-function audited raw-pointer
   boundary.
 - `rocev2-io`: complete-IPv4-packet I/O. MockIO is deterministic, raw IPv4 is
-  the correctness backend, and AF_XDP is the high-throughput backend.
+  the correctness backend, and AF_XDP is the intended high-throughput backend.
 - `rocev2`: endpoint/QP integration and the public API.
 
 ## Ownership model
@@ -21,6 +21,12 @@ memory safety and operating-system I/O:
 A polling thread owns its endpoint and QP shard. There is no mutex, task per QP,
 or channel in the packet path. Work queues, completion queues, packet buffers and
 QP tables are fixed-capacity and allocated at endpoint construction.
+
+Each shard uses a fixed open-addressed QPN index to map the destination QPN to
+its QP slot. The index is kept at or below 50 percent load, uses contiguous
+linear probing, and removes entries with backward shifting so QP churn does not
+accumulate tombstones. Packet routing therefore avoids a scan across all QPs
+and performs no allocation.
 
 The safe memory-registration API transfers an exclusive slice borrow into the
 registry. Network-supplied `(address, rkey, length)` is checked in this order:
@@ -46,8 +52,8 @@ produce a sequence NAK. RNR leaves the expected PSN unchanged.
 ## Allocation and unsafe-code policy
 
 No steady-state endpoint operation performs a heap allocation. The raw IPv4
-backend allocates only while opening sockets. AF_XDP allocates and maps UMEM and
-rings during construction, then uses caller-owned frames and SPSC rings.
+backend allocates only while opening sockets. A future AF_XDP backend will map
+UMEM and rings during construction, then use caller-owned frames and SPSC rings.
 
 `unsafe` is denied workspace-wide and relaxed only in the two crates that cross
 raw pointer or kernel ABI boundaries. Each use is documented next to the
