@@ -1,4 +1,4 @@
-name: bootstrap-source
+name: remove-broken-bootstrap
 
 on:
   push:
@@ -12,27 +12,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  materialize:
+  remove:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Materialize staged source tree
+      - name: Remove unrecoverable staged archive
         shell: bash
         run: |
           set -euo pipefail
-          : > /tmp/rocev2-src.tgz
-          for part in .bootstrap/part-*; do
-            printf 'decoding %s\n' "$part"
-            tr -cd 'A-Za-z0-9+/=' < "$part" | base64 --decode >> /tmp/rocev2-src.tgz
-          done
-          gzip --test /tmp/rocev2-src.tgz
-          tar --list --gzip --file /tmp/rocev2-src.tgz >/dev/null
-          tar --extract --gzip --file /tmp/rocev2-src.tgz --overwrite
           rm -rf .bootstrap .github/workflows/bootstrap.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add --all
-          git commit -m 'feat: materialize pure-Rust RoCEv2 workspace'
+          git commit -m 'chore: remove unrecoverable bootstrap archive'
           git push origin HEAD:feat/initial-rocev2-stack
