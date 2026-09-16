@@ -19,11 +19,18 @@ must not be claimed before qualification runs exist.
   per WQE and CQ generation for requester and receive work.
 - Fixed-capacity open-addressed local-QPN routing with collision-safe deletion,
   bounded load factor, and no per-packet scan across the QP table.
+- Fixed-capacity requester/responder ready queues and an indexed deadline
+  min-heap, eliminating QP-table scans for transmit work and retry timers while
+  preserving packet-granularity round-robin fairness within and across
+  requester/responder traffic classes.
 - MTU segmentation/reassembly, positive ACKs, sequence/access/invalid-request
   NAKs, RNR NAKs, timeout and NAK retry scheduling, duplicate suppression, and
   RDMA READ response replay.
 - Two-endpoint deterministic tests for segmented SEND, WRITE followed by READ,
-  RNR recovery, packet-loss timeout retransmission, and remote-access failure.
+  RNR recovery, packet-loss timeout retransmission, and remote-access failure,
+  plus active-QP and requester/responder class fairness, multiple simultaneous
+  deadline expiry, reset cancellation, and randomized scheduler-model
+  differential tests.
 
 ## Implemented but not yet qualified as production-ready
 

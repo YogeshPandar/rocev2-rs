@@ -1,8 +1,8 @@
 //! Black-box RC endpoint execution and reliability tests.
 
-use rocev2::io::{Frame, MockIo};
+use rocev2::io::{Frame, MockIo, PacketIo};
 use rocev2::memory::AccessFlags;
-use rocev2::wire::{Aeth, AethClass, Bth, Opcode, PacketSpec};
+use rocev2::wire::{Aeth, AethClass, Bth, Opcode, PacketSpec, Reth};
 use rocev2::{
     Completion, CompletionOpcode, CompletionStatus, Ipv4Path, PathMtu, Psn, QpConfig, QpHandle,
     QpState, RcEndpoint, RcEndpointConfig, RcQpConfig, RecvWorkRequest, Sge, WorkRequest,
@@ -10,6 +10,59 @@ use rocev2::{
 };
 
 type TestEndpoint<'a> = RcEndpoint<'a, MockIo, 2, 8, 8, 8, 16, 4>;
+
+#[derive(Debug)]
+struct FailOnceIo {
+    fail_next_transmit: bool,
+    receive: Option<Box<[u8]>>,
+    transmitted: Option<Box<[u8]>>,
+}
+
+impl FailOnceIo {
+    fn new() -> Self {
+        Self {
+            fail_next_transmit: true,
+            receive: None,
+            transmitted: None,
+        }
+    }
+
+    fn inject_receive(&mut self, packet: &[u8]) {
+        self.receive = Some(packet.into());
+    }
+}
+
+impl PacketIo for FailOnceIo {
+    type Error = std::io::Error;
+
+    fn max_ipv4_packet(&self) -> usize {
+        512
+    }
+
+    fn transmit_ipv4(&mut self, packet: &[u8]) -> Result<(), Self::Error> {
+        if self.fail_next_transmit {
+            self.fail_next_transmit = false;
+            return Err(std::io::Error::other("injected transmit failure"));
+        }
+        self.transmitted = Some(packet.into());
+        Ok(())
+    }
+
+    fn receive_ipv4(&mut self, output: &mut [u8]) -> Result<Option<usize>, Self::Error> {
+        let Some(packet) = self.receive.as_ref() else {
+            return Ok(None);
+        };
+        if output.len() < packet.len() {
+            return Err(std::io::Error::other(
+                "injected receive buffer is too short",
+            ));
+        }
+        let length = packet.len();
+        output[..length].copy_from_slice(packet);
+        self.receive = None;
+        Ok(Some(length))
+    }
+}
 
 fn endpoint<'a>() -> TestEndpoint<'a> {
     RcEndpoint::new(
@@ -51,6 +104,33 @@ fn ready(endpoint: &mut TestEndpoint<'_>, handle: QpHandle) {
     endpoint.transition_qp(handle, QpState::Init).unwrap();
     endpoint.transition_qp(handle, QpState::Rtr).unwrap();
     endpoint.transition_qp(handle, QpState::Rts).unwrap();
+}
+
+fn encode_read_request(
+    output: &mut [u8],
+    path: Ipv4Path,
+    destination_qpn: u32,
+    psn: u32,
+    remote_address: u64,
+    rkey: u32,
+    length: u32,
+) -> usize {
+    encode_ipv4_packet(
+        path,
+        PacketSpec {
+            bth: Bth::new(Opcode::RdmaReadRequest, destination_qpn, psn),
+            reth: Some(Reth {
+                virtual_address: remote_address,
+                remote_key: rkey,
+                dma_length: length,
+            }),
+            aeth: None,
+            immediate_data: None,
+            payload: &[],
+        },
+        output,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -790,4 +870,360 @@ fn stale_duplicate_read_does_not_replace_active_response() {
         Some(Completion::success(2, CompletionOpcode::RdmaRead, 300))
     );
     assert_eq!(requester.stats().retransmissions, 0);
+}
+
+#[test]
+fn requester_ready_queue_round_robins_segmented_qps() {
+    let mut source = [0x41_u8; 300];
+    let mut endpoint = endpoint();
+    let source_mr = endpoint
+        .register_memory(&mut source, AccessFlags::NONE)
+        .unwrap();
+    let first = endpoint
+        .create_qp(qp_config(2, 3, 10, 100, [192, 0, 2, 1], [192, 0, 2, 2]))
+        .unwrap();
+    let second = endpoint
+        .create_qp(qp_config(4, 5, 20, 200, [192, 0, 2, 1], [192, 0, 2, 3]))
+        .unwrap();
+    ready(&mut endpoint, first);
+    ready(&mut endpoint, second);
+    endpoint
+        .post_work(
+            first,
+            WorkRequest::send(
+                1,
+                Sge::new(source_mr.address(), 300, source_mr.lkey()),
+                true,
+            ),
+        )
+        .unwrap();
+    endpoint
+        .post_work(
+            second,
+            WorkRequest::send(
+                2,
+                Sge::new(source_mr.address(), 300, source_mr.lkey()),
+                true,
+            ),
+        )
+        .unwrap();
+
+    let mut receive = [0_u8; 512];
+    let mut transmit = [0_u8; 512];
+    let mut observed = [(Opcode::Acknowledge, 0, 0); 4];
+    for (now, item) in observed.iter_mut().enumerate() {
+        let progress = endpoint
+            .progress(now as u64, &mut receive, &mut transmit)
+            .unwrap();
+        assert_eq!(progress.transmitted_packets, 1);
+        let frame = endpoint.io_mut().pop_transmitted().unwrap();
+        let packet = decode_ipv4_packet(frame.as_bytes()).unwrap().transport;
+        *item = (
+            packet.bth.opcode,
+            packet.bth.destination_qpn,
+            packet.bth.psn,
+        );
+    }
+
+    assert_eq!(
+        observed,
+        [
+            (Opcode::SendFirst, 3, 10),
+            (Opcode::SendFirst, 5, 20),
+            (Opcode::SendLast, 3, 11),
+            (Opcode::SendLast, 5, 21),
+        ]
+    );
+}
+
+#[test]
+fn requester_and_responder_ready_classes_share_transmit_slots() {
+    type FairEndpoint<'a> = RcEndpoint<'a, MockIo, 4, 8, 8, 8, 16, 8>;
+
+    let mut source = [0x46_u8; 300];
+    let mut remote = [0x57_u8; 8];
+    let mut endpoint = FairEndpoint::new(
+        MockIo::new(512),
+        RcEndpointConfig {
+            maximum_packet_size: 512,
+            ticks_per_second: 1_000_000,
+            memory_key_seed: 7,
+        },
+    )
+    .unwrap();
+    let source_mr = endpoint
+        .register_memory(&mut source, AccessFlags::NONE)
+        .unwrap();
+    let remote_mr = endpoint
+        .register_memory(&mut remote, AccessFlags::REMOTE_READ)
+        .unwrap();
+
+    let local_ip = [198, 51, 100, 1];
+    let requester = endpoint
+        .create_qp(qp_config(2, 3, 10, 100, local_ip, [198, 51, 100, 2]))
+        .unwrap();
+    let first_responder = endpoint
+        .create_qp(qp_config(4, 5, 20, 200, local_ip, [198, 51, 100, 3]))
+        .unwrap();
+    let second_responder = endpoint
+        .create_qp(qp_config(6, 7, 30, 300, local_ip, [198, 51, 100, 4]))
+        .unwrap();
+    for handle in [requester, first_responder, second_responder] {
+        endpoint.transition_qp(handle, QpState::Init).unwrap();
+        endpoint.transition_qp(handle, QpState::Rtr).unwrap();
+        endpoint.transition_qp(handle, QpState::Rts).unwrap();
+    }
+    endpoint
+        .post_work(
+            requester,
+            WorkRequest::send(
+                1,
+                Sge::new(source_mr.address(), 300, source_mr.lkey()),
+                true,
+            ),
+        )
+        .unwrap();
+
+    let mut packet = [0_u8; 512];
+    let first_request_length = encode_read_request(
+        &mut packet,
+        Ipv4Path::new([198, 51, 100, 3], local_ip, 49_152),
+        4,
+        200,
+        remote_mr.address(),
+        remote_mr.rkey(),
+        8,
+    );
+    endpoint
+        .io_mut()
+        .inject_receive(&packet[..first_request_length])
+        .unwrap();
+
+    let mut receive = [0_u8; 512];
+    let mut transmit = [0_u8; 512];
+    endpoint.progress(0, &mut receive, &mut transmit).unwrap();
+    let first = endpoint.io_mut().pop_transmitted().unwrap();
+    let first = decode_ipv4_packet(first.as_bytes()).unwrap().transport;
+    assert_eq!(first.bth.opcode, Opcode::RdmaReadResponseOnly);
+    assert_eq!(first.bth.destination_qpn, 5);
+
+    let second_request_length = encode_read_request(
+        &mut packet,
+        Ipv4Path::new([198, 51, 100, 4], local_ip, 49_152),
+        6,
+        300,
+        remote_mr.address(),
+        remote_mr.rkey(),
+        8,
+    );
+    endpoint
+        .io_mut()
+        .inject_receive(&packet[..second_request_length])
+        .unwrap();
+
+    endpoint.progress(1, &mut receive, &mut transmit).unwrap();
+    let second = endpoint.io_mut().pop_transmitted().unwrap();
+    let second = decode_ipv4_packet(second.as_bytes()).unwrap().transport;
+    assert_eq!(second.bth.opcode, Opcode::SendFirst);
+    assert_eq!(second.bth.destination_qpn, 3);
+
+    endpoint.progress(2, &mut receive, &mut transmit).unwrap();
+    let third = endpoint.io_mut().pop_transmitted().unwrap();
+    let third = decode_ipv4_packet(third.as_bytes()).unwrap().transport;
+    assert_eq!(third.bth.opcode, Opcode::RdmaReadResponseOnly);
+    assert_eq!(third.bth.destination_qpn, 7);
+
+    endpoint.progress(3, &mut receive, &mut transmit).unwrap();
+    let fourth = endpoint.io_mut().pop_transmitted().unwrap();
+    let fourth = decode_ipv4_packet(fourth.as_bytes()).unwrap().transport;
+    assert_eq!(fourth.bth.opcode, Opcode::SendLast);
+    assert_eq!(fourth.bth.destination_qpn, 3);
+}
+
+#[test]
+fn deadline_scheduler_services_one_expired_qp_per_progress() {
+    let mut source = [0x52_u8; 8];
+    let mut endpoint = endpoint();
+    let source_mr = endpoint
+        .register_memory(&mut source, AccessFlags::NONE)
+        .unwrap();
+    let first = endpoint
+        .create_qp(qp_config(2, 3, 10, 100, [10, 1, 0, 1], [10, 1, 0, 2]))
+        .unwrap();
+    let second = endpoint
+        .create_qp(qp_config(4, 5, 20, 200, [10, 1, 0, 1], [10, 1, 0, 3]))
+        .unwrap();
+    ready(&mut endpoint, first);
+    ready(&mut endpoint, second);
+    for (handle, id) in [(first, 1), (second, 2)] {
+        endpoint
+            .post_work(
+                handle,
+                WorkRequest::send(id, Sge::new(source_mr.address(), 8, source_mr.lkey()), true),
+            )
+            .unwrap();
+    }
+
+    let mut receive = [0_u8; 512];
+    let mut transmit = [0_u8; 512];
+    endpoint.progress(0, &mut receive, &mut transmit).unwrap();
+    endpoint.io_mut().pop_transmitted().unwrap();
+    endpoint.progress(1, &mut receive, &mut transmit).unwrap();
+    endpoint.io_mut().pop_transmitted().unwrap();
+
+    endpoint.progress(10, &mut receive, &mut transmit).unwrap();
+    let first_retry = endpoint.io_mut().pop_transmitted().unwrap();
+    let first_retry = decode_ipv4_packet(first_retry.as_bytes()).unwrap();
+    assert_eq!(first_retry.transport.bth.destination_qpn, 3);
+    assert_eq!(endpoint.stats().timeout_events, 1);
+
+    endpoint.progress(10, &mut receive, &mut transmit).unwrap();
+    let second_retry = endpoint.io_mut().pop_transmitted().unwrap();
+    let second_retry = decode_ipv4_packet(second_retry.as_bytes()).unwrap();
+    assert_eq!(second_retry.transport.bth.destination_qpn, 5);
+    assert_eq!(endpoint.stats().timeout_events, 2);
+}
+
+#[test]
+fn reset_cancels_ready_and_deadline_state() {
+    let mut source = [0x63_u8; 8];
+    let mut endpoint = endpoint();
+    let source_mr = endpoint
+        .register_memory(&mut source, AccessFlags::NONE)
+        .unwrap();
+    let handle = endpoint
+        .create_qp(qp_config(2, 3, 7, 70, [10, 2, 0, 1], [10, 2, 0, 2]))
+        .unwrap();
+    ready(&mut endpoint, handle);
+    endpoint
+        .post_work(
+            handle,
+            WorkRequest::send(9, Sge::new(source_mr.address(), 8, source_mr.lkey()), true),
+        )
+        .unwrap();
+
+    let mut receive = [0_u8; 512];
+    let mut transmit = [0_u8; 512];
+    endpoint.progress(0, &mut receive, &mut transmit).unwrap();
+    endpoint.io_mut().pop_transmitted().unwrap();
+    endpoint.transition_qp(handle, QpState::Reset).unwrap();
+
+    assert_eq!(
+        endpoint.poll_completion(handle).unwrap(),
+        Some(Completion::failure(
+            9,
+            CompletionOpcode::Send,
+            CompletionStatus::Flushed,
+        ))
+    );
+    let progress = endpoint.progress(100, &mut receive, &mut transmit).unwrap();
+    assert!(!progress.made_progress());
+    assert!(endpoint.io_mut().pop_transmitted().is_none());
+    assert_eq!(endpoint.stats().timeout_events, 0);
+}
+
+#[test]
+fn requester_remains_scheduled_after_backend_transmit_failure() {
+    type FailEndpoint<'a> = RcEndpoint<'a, FailOnceIo, 1, 2, 2, 2, 4, 2>;
+
+    let mut source = [0x74_u8; 8];
+    let mut endpoint = FailEndpoint::new(
+        FailOnceIo::new(),
+        RcEndpointConfig {
+            maximum_packet_size: 512,
+            ticks_per_second: 1_000_000,
+            memory_key_seed: 11,
+        },
+    )
+    .unwrap();
+    let source_mr = endpoint
+        .register_memory(&mut source, AccessFlags::NONE)
+        .unwrap();
+    let handle = endpoint
+        .create_qp(qp_config(2, 3, 7, 70, [10, 3, 0, 1], [10, 3, 0, 2]))
+        .unwrap();
+    endpoint.transition_qp(handle, QpState::Init).unwrap();
+    endpoint.transition_qp(handle, QpState::Rtr).unwrap();
+    endpoint.transition_qp(handle, QpState::Rts).unwrap();
+    endpoint
+        .post_work(
+            handle,
+            WorkRequest::send(10, Sge::new(source_mr.address(), 8, source_mr.lkey()), true),
+        )
+        .unwrap();
+
+    let mut receive = [0_u8; 512];
+    let mut transmit = [0_u8; 512];
+    assert!(matches!(
+        endpoint.progress(0, &mut receive, &mut transmit),
+        Err(rocev2::PollError::Io(_))
+    ));
+    assert_eq!(endpoint.stats().io_errors, 1);
+
+    let progress = endpoint.progress(1, &mut receive, &mut transmit).unwrap();
+    assert_eq!(progress.transmitted_packets, 1);
+    let packet = endpoint.io_mut().transmitted.take().unwrap();
+    let packet = decode_ipv4_packet(&packet).unwrap();
+    assert_eq!(packet.transport.bth.opcode, Opcode::SendOnly);
+    assert_eq!(packet.transport.bth.psn, 7);
+}
+
+#[test]
+fn read_responder_remains_scheduled_after_backend_transmit_failure() {
+    type FailEndpoint<'a> = RcEndpoint<'a, FailOnceIo, 1, 2, 2, 2, 4, 2>;
+
+    let mut remote = [0x85_u8; 8];
+    let mut endpoint = FailEndpoint::new(
+        FailOnceIo::new(),
+        RcEndpointConfig {
+            maximum_packet_size: 512,
+            ticks_per_second: 1_000_000,
+            memory_key_seed: 12,
+        },
+    )
+    .unwrap();
+    let remote_mr = endpoint
+        .register_memory(&mut remote, AccessFlags::REMOTE_READ)
+        .unwrap();
+    let handle = endpoint
+        .create_qp(qp_config(2, 3, 7, 70, [10, 4, 0, 1], [10, 4, 0, 2]))
+        .unwrap();
+    endpoint.transition_qp(handle, QpState::Init).unwrap();
+    endpoint.transition_qp(handle, QpState::Rtr).unwrap();
+    endpoint.transition_qp(handle, QpState::Rts).unwrap();
+
+    let mut request = [0_u8; 512];
+    let request_length = encode_ipv4_packet(
+        Ipv4Path::new([10, 4, 0, 2], [10, 4, 0, 1], 49_153),
+        PacketSpec {
+            bth: Bth::new(Opcode::RdmaReadRequest, 2, 70),
+            reth: Some(Reth {
+                virtual_address: remote_mr.address(),
+                remote_key: remote_mr.rkey(),
+                dma_length: 8,
+            }),
+            aeth: None,
+            immediate_data: None,
+            payload: &[],
+        },
+        &mut request,
+    )
+    .unwrap();
+    endpoint.io_mut().inject_receive(&request[..request_length]);
+
+    let mut receive = [0_u8; 512];
+    let mut transmit = [0_u8; 512];
+    assert!(matches!(
+        endpoint.progress(0, &mut receive, &mut transmit),
+        Err(rocev2::PollError::Io(_))
+    ));
+    assert_eq!(endpoint.stats().io_errors, 1);
+
+    let progress = endpoint.progress(1, &mut receive, &mut transmit).unwrap();
+    assert_eq!(progress.transmitted_packets, 1);
+    let packet = endpoint.io_mut().transmitted.take().unwrap();
+    let packet = decode_ipv4_packet(&packet).unwrap();
+    assert_eq!(packet.transport.bth.opcode, Opcode::RdmaReadResponseOnly);
+    assert_eq!(packet.transport.bth.psn, 70);
+    assert_eq!(packet.transport.payload, &[0x85; 8]);
 }

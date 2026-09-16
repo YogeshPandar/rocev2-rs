@@ -12,9 +12,9 @@ use crate::{
 };
 use rocev2_core::{
     AckAdvance, Completion, CompletionOpcode, CompletionStatus, MAX_OUTSTANDING_PACKETS, Psn,
-    QpConfig, QpState, QpStateMachine, QpnTable, ReceiveDisposition, ReceivePsn, RecvWorkRequest,
-    RetryBudget, RetryDecision, RetryPolicy, RetryReason, Ring, SendWindow, Timer, WorkRequest,
-    WorkRequestKind, ack_timeout_ticks, rnr_timer_ticks,
+    QpConfig, QpState, QpStateMachine, QpnTable, ReadyQueue, ReceiveDisposition, ReceivePsn,
+    RecvWorkRequest, RetryBudget, RetryDecision, RetryPolicy, RetryReason, Ring, SendWindow, Timer,
+    TimerEntry, TimerScheduler, WorkRequest, WorkRequestKind, ack_timeout_ticks, rnr_timer_ticks,
 };
 use rocev2_io::PacketIo;
 use rocev2_memory::{AccessFlags, MemoryError, MemoryRegistry, RegionHandle};
@@ -222,6 +222,9 @@ struct RcQpSlot<const SQ: usize, const RQ: usize, const CQ: usize> {
     read_response: Option<ReadResponseState>,
     read_replay: Option<ReadResponseState>,
     message_sequence_number: Psn,
+    requester_scheduled: bool,
+    responder_scheduled: bool,
+    timer_sequence: u32,
 }
 
 impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
@@ -242,6 +245,9 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
             read_response: None,
             read_replay: None,
             message_sequence_number: Psn::ZERO,
+            requester_scheduled: false,
+            responder_scheduled: false,
+            timer_sequence: 0,
         })
     }
 
@@ -357,6 +363,27 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
             || !self.receive_queue.is_empty()
             || !self.completion_queue.is_empty()
             || self.completion_reservations != 0
+            || self.requester_scheduled
+            || self.responder_scheduled
+    }
+
+    fn requester_is_runnable(&self) -> bool {
+        match self.active_request {
+            Some(active) => matches!(active.phase, RequestPhase::Sending),
+            None => self.machine.can_send() && !self.send_queue.is_empty(),
+        }
+    }
+
+    fn responder_is_runnable(&self) -> bool {
+        self.machine.can_receive() && self.read_response.is_some()
+    }
+
+    fn timer_deadline(&self) -> Option<u64> {
+        let active = self.active_request?;
+        match active.phase {
+            RequestPhase::Waiting | RequestPhase::RnrWait => active.timer.deadline(),
+            RequestPhase::Sending => None,
+        }
     }
 
     fn reset_transport_state(&mut self) {
@@ -386,6 +413,31 @@ struct HandlerResult {
     retransmissions: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ReadyReadResponse {
+    qp_index: usize,
+    path: Ipv4Path,
+    remote_qpn: u32,
+    response: ReadResponseState,
+    message_sequence_number: Psn,
+    mtu: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DataTxClass {
+    Requester,
+    Responder,
+}
+
+impl DataTxClass {
+    const fn other(self) -> Self {
+        match self {
+            Self::Requester => Self::Responder,
+            Self::Responder => Self::Requester,
+        }
+    }
+}
+
 /// Fixed-capacity posted-work RC endpoint.
 ///
 /// QP state and queues are allocated only during control-plane QP creation.
@@ -413,7 +465,10 @@ pub struct RcEndpoint<
     generations: [u32; QPS],
     qpn_index: Box<QpnTable<QPN_INDEX>>,
     payload_scratch: [u8; MAX_MTU_BYTES],
-    transmit_cursor: usize,
+    requester_ready: ReadyQueue<QPS>,
+    responder_ready: ReadyQueue<QPS>,
+    timer_scheduler: TimerScheduler<QPS>,
+    next_data_tx_class: DataTxClass,
 }
 
 impl<
@@ -457,7 +512,10 @@ where
             generations: [0; QPS],
             qpn_index: Box::new(QpnTable::new()),
             payload_scratch: [0; MAX_MTU_BYTES],
-            transmit_cursor: 0,
+            requester_ready: ReadyQueue::new(),
+            responder_ready: ReadyQueue::new(),
+            timer_scheduler: TimerScheduler::new(),
+            next_data_tx_class: DataTxClass::Responder,
         })
     }
 
@@ -559,6 +617,7 @@ where
         if slot.is_busy() {
             return Err(ApiError::QpBusy);
         }
+        self.deschedule_qp(index);
         let slot = self.qps[index].take().ok_or(ApiError::InvalidQpHandle)?;
         let config = slot.config();
         let removed = self.qpn_index.remove(config.transport.local_qpn);
@@ -617,6 +676,7 @@ where
         slot.path = config.path;
         slot.rnr_nak_timer = config.rnr_nak_timer;
         slot.reset_transport_state();
+        self.synchronize_qp(index);
         Ok(())
     }
 
@@ -626,19 +686,23 @@ where
         handle: QpHandle,
         destination: QpState,
     ) -> Result<(), ApiError> {
-        let slot = self.qp_slot_mut(handle)?;
-        let generated = if matches!(destination, QpState::Error) {
-            slot.machine.transition(destination)?;
-            slot.flush_pending()
-        } else if matches!(destination, QpState::Reset) {
-            slot.machine.transition(destination)?;
-            let completions = slot.flush_pending();
-            slot.reset_transport_state();
-            completions
-        } else {
-            slot.machine.transition(destination)?;
-            0
+        let index = self.qp_index(handle)?;
+        let generated = {
+            let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
+            if matches!(destination, QpState::Error) {
+                slot.machine.transition(destination)?;
+                slot.flush_pending()
+            } else if matches!(destination, QpState::Reset) {
+                slot.machine.transition(destination)?;
+                let completions = slot.flush_pending();
+                slot.reset_transport_state();
+                completions
+            } else {
+                slot.machine.transition(destination)?;
+                0
+            }
         };
+        self.synchronize_qp(index);
         self.stats.completions = self
             .stats
             .completions
@@ -686,17 +750,20 @@ where
             }
         }
 
-        let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
-        if slot.send_queue.is_full() {
-            return Err(ApiError::QueueFull(QueueKind::Send));
+        {
+            let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
+            if slot.send_queue.is_full() {
+                return Err(ApiError::QueueFull(QueueKind::Send));
+            }
+            slot.reserve_completion()?;
+            if let Err(error) = slot.send_queue.push(work) {
+                slot.completion_reservations = slot.completion_reservations.saturating_sub(1);
+                return Err(ApiError::QueueFull(match error {
+                    rocev2_core::PushError::Full(_) => QueueKind::Send,
+                }));
+            }
         }
-        slot.reserve_completion()?;
-        if let Err(error) = slot.send_queue.push(work) {
-            slot.completion_reservations = slot.completion_reservations.saturating_sub(1);
-            return Err(ApiError::QueueFull(match error {
-                rocev2_core::PushError::Full(_) => QueueKind::Send,
-            }));
-        }
+        self.synchronize_qp(index);
         self.stats.posted_work_requests = self.stats.posted_work_requests.saturating_add(1);
         Ok(())
     }
@@ -779,19 +846,46 @@ where
             }
         }
 
-        let responder_result = self.emit_read_response(transmit_buffer)?;
-        progress.completions += responder_result.completions;
-        if responder_result.transmitted {
-            progress.transmitted_packets = 1;
-            return Ok(progress);
-        }
-
-        let requester_result = self.emit_requester(now, transmit_buffer)?;
-        progress.completions += requester_result.completions;
-        if requester_result.transmitted {
+        let data_result = self.emit_data_packet(now, transmit_buffer)?;
+        progress.completions += data_result.completions;
+        if data_result.transmitted {
             progress.transmitted_packets = 1;
         }
         Ok(progress)
+    }
+
+    fn emit_data_packet(
+        &mut self,
+        now: u64,
+        output: &mut [u8],
+    ) -> Result<EmitResult, PollError<Io::Error>> {
+        let first_class = self.next_data_tx_class;
+        let second_class = first_class.other();
+        let mut result = self.emit_data_class(first_class, now, output)?;
+        if result.transmitted {
+            self.next_data_tx_class = second_class;
+            return Ok(result);
+        }
+
+        let fallback = self.emit_data_class(second_class, now, output)?;
+        result.completions = result.completions.saturating_add(fallback.completions);
+        result.transmitted = fallback.transmitted;
+        if fallback.transmitted {
+            self.next_data_tx_class = first_class;
+        }
+        Ok(result)
+    }
+
+    fn emit_data_class(
+        &mut self,
+        class: DataTxClass,
+        now: u64,
+        output: &mut [u8],
+    ) -> Result<EmitResult, PollError<Io::Error>> {
+        match class {
+            DataTxClass::Requester => self.emit_requester(now, output),
+            DataTxClass::Responder => self.emit_read_response(output),
+        }
     }
 
     fn validate_poll_buffers(
@@ -878,27 +972,30 @@ where
             });
         }
 
-        let slot = self
-            .qps
-            .get_mut(index)
-            .and_then(Option::as_mut)
-            .ok_or(ApiError::InvalidQpHandle)?;
-        if !slot.machine.can_receive() {
-            return Err(ApiError::QpNotReady(slot.machine.state()));
-        }
+        let result = {
+            let slot = self
+                .qps
+                .get_mut(index)
+                .and_then(Option::as_mut)
+                .ok_or(ApiError::InvalidQpHandle)?;
+            if !slot.machine.can_receive() {
+                return Err(ApiError::QpNotReady(slot.machine.state()));
+            }
 
-        let result = if decoded.transport.bth.opcode.is_request() {
-            handle_request_packet(slot, &mut self.memory, decoded.transport, &mut self.stats)
-        } else {
-            handle_response_packet(
-                slot,
-                &mut self.memory,
-                decoded.transport,
-                now,
-                self.config.ticks_per_second,
-                &mut self.stats,
-            )
+            if decoded.transport.bth.opcode.is_request() {
+                handle_request_packet(slot, &mut self.memory, decoded.transport, &mut self.stats)
+            } else {
+                handle_response_packet(
+                    slot,
+                    &mut self.memory,
+                    decoded.transport,
+                    now,
+                    self.config.ticks_per_second,
+                    &mut self.stats,
+                )
+            }
         };
+        self.synchronize_qp(index);
         self.stats.completions = self
             .stats
             .completions
@@ -947,31 +1044,63 @@ where
 
     fn service_timers(&mut self, now: u64) -> HandlerResult {
         let mut result = HandlerResult::default();
-        for slot in self.qps.iter_mut().flatten() {
-            let action = slot.active_request.and_then(|active| {
-                if active.timer.expired(now) {
+
+        while let Some(entry) = self.timer_scheduler.pop_expired(now) {
+            let Ok(index) = usize::try_from(entry.qp_slot()) else {
+                continue;
+            };
+            let action = self
+                .qps
+                .get(index)
+                .and_then(Option::as_ref)
+                .and_then(|slot| {
+                    if slot.generation != entry.qp_generation()
+                        || slot.timer_sequence != entry.sequence()
+                    {
+                        return None;
+                    }
+                    let active = slot.active_request?;
+                    if slot.timer_deadline() != Some(entry.deadline()) || !active.timer.expired(now)
+                    {
+                        return None;
+                    }
                     Some(active.phase)
-                } else {
-                    None
-                }
-            });
+                });
+
+            let Some(action) = action else {
+                self.synchronize_qp(index);
+                continue;
+            };
+
+            let Some(slot) = self.qps.get_mut(index).and_then(Option::as_mut) else {
+                self.synchronize_qp(index);
+                continue;
+            };
             match action {
-                Some(RequestPhase::Waiting) => {
+                RequestPhase::Waiting => {
                     self.stats.timeout_events = self.stats.timeout_events.saturating_add(1);
                     let retry = schedule_transport_retry(slot, &mut self.stats);
                     result.completions += retry.completions;
                     result.retransmissions += retry.retransmissions;
                 }
-                Some(RequestPhase::RnrWait) => {
+                RequestPhase::RnrWait => {
                     if let Some(active) = slot.active_request.as_mut() {
                         active.reset_for_retry();
                         self.stats.retransmissions = self.stats.retransmissions.saturating_add(1);
                         result.retransmissions += 1;
                     }
                 }
-                Some(RequestPhase::Sending) | None => {}
+                RequestPhase::Sending => {
+                    debug_assert!(false, "sending request must not retain an armed timer");
+                    if let Some(active) = slot.active_request.as_mut() {
+                        active.timer.cancel();
+                    }
+                }
             }
+            self.synchronize_qp(index);
+            break;
         }
+
         self.stats.completions = self
             .stats
             .completions
@@ -983,95 +1112,127 @@ where
         &mut self,
         output: &mut [u8],
     ) -> Result<EmitResult, PollError<Io::Error>> {
-        let Some(index) = self.next_qp_with_read_response() else {
+        let Some(ready) = self.dequeue_read_response() else {
             return Ok(EmitResult::default());
         };
-        let (state, path, remote_qpn, response, msn, mtu) = {
-            let slot = self.qps[index].as_ref().ok_or(ApiError::InvalidQpHandle)?;
-            (
-                slot.machine.state(),
-                slot.path,
-                slot.machine.config().remote_qpn,
-                slot.read_response.ok_or(ApiError::InvalidQpHandle)?,
-                slot.message_sequence_number,
-                slot.machine.config().path_mtu.bytes(),
+        let segment = read_response_segment(ready.response, ready.mtu);
+        let (address, payload_length) = match segment {
+            Ok(segment) => segment,
+            Err(error) => {
+                self.synchronize_qp(ready.qp_index);
+                return Err(error.into());
+            }
+        };
+        if self
+            .memory
+            .read_remote(
+                ready.response.rkey,
+                address,
+                &mut self.payload_scratch[..payload_length],
             )
-        };
-        if !matches!(
-            state,
-            QpState::Rtr | QpState::Rts | QpState::Sqd | QpState::Sqe
-        ) {
-            return Ok(EmitResult::default());
-        }
-
-        let (offset, payload_length) = segment_bounds(response.length, mtu, response.next_packet)
-            .ok_or(ApiError::ArithmeticOverflow)?;
-        let address = response
-            .address
-            .checked_add(u64::try_from(offset).map_err(|_| ApiError::ArithmeticOverflow)?)
-            .ok_or(ApiError::ArithmeticOverflow)?;
-        if let Err(_error) = self.memory.read_remote(
-            response.rkey,
-            address,
-            &mut self.payload_scratch[..payload_length],
-        ) {
-            let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
-            let completions = slot.enter_error();
-            self.stats.completions = self
-                .stats
-                .completions
-                .saturating_add(u64::try_from(completions).unwrap_or(u64::MAX));
-            return Ok(EmitResult {
-                transmitted: false,
-                completions,
-            });
+            .is_err()
+        {
+            return Ok(self.fail_read_responder(ready.qp_index));
         }
 
         let opcode = segmented_opcode(
             TransferDirection::ReadResponse,
-            response.next_packet,
-            response.packet_count,
+            ready.response.next_packet,
+            ready.response.packet_count,
         );
-        let aeth = if opcode.has_aeth() {
-            Some(Aeth::ack(msn.value()))
-        } else {
-            None
-        };
         let packet = PacketSpec {
             bth: Bth::new(
                 opcode,
-                remote_qpn,
-                response
+                ready.remote_qpn,
+                ready
+                    .response
                     .request_psn
-                    .wrapping_add(response.next_packet)
+                    .wrapping_add(ready.response.next_packet)
                     .value(),
             ),
             reth: None,
-            aeth,
+            aeth: opcode
+                .has_aeth()
+                .then(|| Aeth::ack(ready.message_sequence_number.value())),
             immediate_data: None,
             payload: &self.payload_scratch[..payload_length],
         };
-        transmit_packet(
+        if let Err(error) = transmit_packet(
             &mut self.io,
             &mut self.stats,
             self.config.maximum_packet_size,
-            path,
+            ready.path,
             packet,
             output,
-        )?;
+        ) {
+            self.synchronize_qp(ready.qp_index);
+            return Err(error);
+        }
 
-        let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
+        self.advance_read_response(ready.qp_index)?;
+        Ok(EmitResult {
+            transmitted: true,
+            completions: 0,
+        })
+    }
+
+    fn dequeue_read_response(&mut self) -> Option<ReadyReadResponse> {
+        while let Some(index) = self.responder_ready.pop() {
+            let ready = self
+                .qps
+                .get_mut(index)
+                .and_then(Option::as_mut)
+                .and_then(|slot| {
+                    slot.responder_scheduled = false;
+                    let response = slot.read_response?;
+                    slot.responder_is_runnable().then_some(ReadyReadResponse {
+                        qp_index: index,
+                        path: slot.path,
+                        remote_qpn: slot.machine.config().remote_qpn,
+                        response,
+                        message_sequence_number: slot.message_sequence_number,
+                        mtu: slot.machine.config().path_mtu.bytes(),
+                    })
+                });
+            if ready.is_some() {
+                return ready;
+            }
+            self.synchronize_qp(index);
+        }
+        None
+    }
+
+    fn fail_read_responder(&mut self, index: usize) -> EmitResult {
+        let completions = self
+            .qps
+            .get_mut(index)
+            .and_then(Option::as_mut)
+            .map_or(0, |slot| slot.enter_error());
+        self.synchronize_qp(index);
+        self.stats.completions = self
+            .stats
+            .completions
+            .saturating_add(u64::try_from(completions).unwrap_or(u64::MAX));
+        EmitResult {
+            transmitted: false,
+            completions,
+        }
+    }
+
+    fn advance_read_response(&mut self, index: usize) -> Result<(), ApiError> {
+        let slot = self
+            .qps
+            .get_mut(index)
+            .and_then(Option::as_mut)
+            .ok_or(ApiError::InvalidQpHandle)?;
         if let Some(active) = slot.read_response.as_mut() {
             active.next_packet += 1;
             if active.next_packet == active.packet_count {
                 slot.read_response = None;
             }
         }
-        self.advance_transmit_cursor(index);
-        Ok(EmitResult {
-            transmitted: true,
-            completions: 0,
-        })
+        self.synchronize_qp(index);
+        Ok(())
     }
 
     fn emit_requester(
@@ -1080,20 +1241,24 @@ where
         output: &mut [u8],
     ) -> Result<EmitResult, PollError<Io::Error>> {
         let mut generated = 0;
-        for step in 0..QPS {
-            let index = cursor_index(self.transmit_cursor, step, QPS);
-            let Some(slot) = self.qps[index].as_mut() else {
+
+        while let Some(index) = self.requester_ready.pop() {
+            let Some(slot) = self.qps.get_mut(index).and_then(Option::as_mut) else {
                 continue;
             };
+            slot.requester_scheduled = false;
             start_next_request(slot, self.config.ticks_per_second);
             let Some(active) = slot.active_request else {
+                self.synchronize_qp(index);
                 continue;
             };
             if !matches!(active.phase, RequestPhase::Sending) {
+                self.synchronize_qp(index);
                 continue;
             }
 
             let config = slot.machine.config();
+            let path = slot.path;
             let timeout_ticks = ack_timeout_ticks(config.timeout, self.config.ticks_per_second)
                 .ok_or(ApiError::InvalidTicksPerSecond)?;
             let packet = match build_request_packet(
@@ -1105,27 +1270,43 @@ where
             ) {
                 Ok(packet) => packet,
                 Err(RequestPacketError::ArithmeticOverflow) => {
+                    self.synchronize_qp(index);
+                    self.stats.completions = self
+                        .stats
+                        .completions
+                        .saturating_add(u64::try_from(generated).unwrap_or(u64::MAX));
                     return Err(ApiError::ArithmeticOverflow.into());
                 }
                 Err(RequestPacketError::LocalProtection) => {
-                    generated +=
-                        fail_active_and_error(slot, CompletionStatus::LocalProtectionError);
+                    generated += fail_active_and_error(
+                        self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?,
+                        CompletionStatus::LocalProtectionError,
+                    );
+                    self.synchronize_qp(index);
                     continue;
                 }
             };
 
-            transmit_packet(
+            let transmitted = transmit_packet(
                 &mut self.io,
                 &mut self.stats,
                 self.config.maximum_packet_size,
-                slot.path,
+                path,
                 packet,
                 output,
-            )?;
+            );
+            if let Err(error) = transmitted {
+                self.synchronize_qp(index);
+                self.stats.completions = self
+                    .stats
+                    .completions
+                    .saturating_add(u64::try_from(generated).unwrap_or(u64::MAX));
+                return Err(error);
+            }
 
             let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
             mark_request_packet_sent(slot, now, timeout_ticks);
-            self.advance_transmit_cursor(index);
+            self.synchronize_qp(index);
             self.stats.completions = self
                 .stats
                 .completions
@@ -1146,18 +1327,82 @@ where
         })
     }
 
-    fn next_qp_with_read_response(&self) -> Option<usize> {
-        (0..QPS)
-            .map(|step| cursor_index(self.transmit_cursor, step, QPS))
-            .find(|&index| {
-                self.qps[index]
-                    .as_ref()
-                    .is_some_and(|slot| slot.read_response.is_some())
-            })
+    fn synchronize_qp(&mut self, index: usize) {
+        let Some(slot) = self.qps.get(index).and_then(Option::as_ref) else {
+            self.deschedule_qp(index);
+            return;
+        };
+        let requester_runnable = slot.requester_is_runnable();
+        let responder_runnable = slot.responder_is_runnable();
+        let timer_deadline = slot.timer_deadline();
+        let generation = slot.generation;
+        let timer_sequence = slot.timer_sequence;
+
+        if requester_runnable {
+            let inserted = self.requester_ready.schedule(index);
+            debug_assert!(inserted || self.requester_ready.is_scheduled(index));
+        } else {
+            self.requester_ready.cancel(index);
+        }
+        if responder_runnable {
+            let inserted = self.responder_ready.schedule(index);
+            debug_assert!(inserted || self.responder_ready.is_scheduled(index));
+        } else {
+            self.responder_ready.cancel(index);
+        }
+
+        if let Ok(qp_slot) = u32::try_from(index) {
+            match timer_deadline {
+                Some(deadline) => {
+                    let current_matches = self.timer_scheduler.get(qp_slot).is_some_and(|entry| {
+                        entry.deadline() == deadline
+                            && entry.qp_generation() == generation
+                            && entry.sequence() == timer_sequence
+                    });
+                    if !current_matches {
+                        let sequence = self.qps[index].as_mut().map(|slot| {
+                            slot.timer_sequence = next_timer_sequence(slot.timer_sequence);
+                            slot.timer_sequence
+                        });
+                        if let Some(sequence) = sequence {
+                            let scheduled = self
+                                .timer_scheduler
+                                .schedule(TimerEntry::new(deadline, qp_slot, generation, sequence));
+                            debug_assert!(scheduled);
+                        }
+                    }
+                }
+                None => {
+                    if self.timer_scheduler.cancel(qp_slot).is_some() {
+                        if let Some(slot) = self.qps[index].as_mut() {
+                            slot.timer_sequence = next_timer_sequence(slot.timer_sequence);
+                        }
+                    }
+                }
+            }
+        } else {
+            debug_assert!(false, "QP slot index must fit QpHandle's u32 slot field");
+        }
+
+        let requester_scheduled = self.requester_ready.is_scheduled(index);
+        let responder_scheduled = self.responder_ready.is_scheduled(index);
+        if let Some(slot) = self.qps.get_mut(index).and_then(Option::as_mut) {
+            slot.requester_scheduled = requester_scheduled;
+            slot.responder_scheduled = responder_scheduled;
+        }
     }
 
-    fn advance_transmit_cursor(&mut self, index: usize) {
-        self.transmit_cursor = if QPS == 0 { 0 } else { (index + 1) % QPS };
+    fn deschedule_qp(&mut self, index: usize) {
+        self.requester_ready.cancel(index);
+        self.responder_ready.cancel(index);
+        if let Ok(qp_slot) = u32::try_from(index) {
+            self.timer_scheduler.cancel(qp_slot);
+        }
+        if let Some(slot) = self.qps.get_mut(index).and_then(Option::as_mut) {
+            slot.requester_scheduled = false;
+            slot.responder_scheduled = false;
+            slot.timer_sequence = next_timer_sequence(slot.timer_sequence);
+        }
     }
 
     fn qp_index(&self, handle: QpHandle) -> Result<usize, ApiError> {
@@ -1219,6 +1464,11 @@ fn packet_count(length: u32, mtu: usize) -> u32 {
     u32::try_from(length.div_ceil(mtu)).unwrap_or(u32::MAX)
 }
 
+const fn next_timer_sequence(sequence: u32) -> u32 {
+    let next = sequence.wrapping_add(1);
+    if next == 0 { 1 } else { next }
+}
+
 fn segment_bounds(length: u32, mtu: usize, index: u32) -> Option<(usize, usize)> {
     let total = usize::try_from(length).ok()?;
     if total == 0 {
@@ -1230,6 +1480,20 @@ fn segment_bounds(length: u32, mtu: usize, index: u32) -> Option<(usize, usize)>
         return None;
     }
     Some((offset, total.saturating_sub(offset).min(mtu)))
+}
+
+fn read_response_segment(
+    response: ReadResponseState,
+    mtu: usize,
+) -> Result<(u64, usize), ApiError> {
+    let (offset, payload_length) = segment_bounds(response.length, mtu, response.next_packet)
+        .ok_or(ApiError::ArithmeticOverflow)?;
+    let offset = u64::try_from(offset).map_err(|_| ApiError::ArithmeticOverflow)?;
+    let address = response
+        .address
+        .checked_add(offset)
+        .ok_or(ApiError::ArithmeticOverflow)?;
+    Ok((address, payload_length))
 }
 
 fn segmented_opcode(direction: TransferDirection, index: u32, count: u32) -> Opcode {
@@ -1248,14 +1512,6 @@ fn segmented_opcode(direction: TransferDirection, index: u32, count: u32) -> Opc
         (TransferDirection::ReadResponse, true, false) => Opcode::RdmaReadResponseFirst,
         (TransferDirection::ReadResponse, false, true) => Opcode::RdmaReadResponseLast,
         (TransferDirection::ReadResponse, false, false) => Opcode::RdmaReadResponseMiddle,
-    }
-}
-
-fn cursor_index(cursor: usize, step: usize, capacity: usize) -> usize {
-    if capacity == 0 {
-        0
-    } else {
-        (cursor + step) % capacity
     }
 }
 
