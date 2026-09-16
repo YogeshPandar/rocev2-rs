@@ -2,9 +2,21 @@
 
 use core::fmt;
 use rocev2_core::StateTransitionError;
+use rocev2_memory::MemoryError;
 use rocev2_wire::WireError;
 
-/// Configuration, packet, or queue-pair error returned by the public API.
+/// Fixed-capacity queue that rejected a post operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueKind {
+    /// Queue-pair send queue.
+    Send,
+    /// Queue-pair receive queue.
+    Receive,
+    /// Queue-pair completion queue or its reservation pool.
+    Completion,
+}
+
+/// Configuration, packet, memory, or queue-pair error returned by the public API.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ApiError {
@@ -58,6 +70,37 @@ pub enum ApiError {
     QpNotReady(rocev2_core::QpState),
     /// Queue-pair validation or transition failed.
     QpState(StateTransitionError),
+    /// Registered-memory validation or lifecycle operation failed.
+    Memory(MemoryError),
+    /// A fixed-capacity work or completion queue is full.
+    QueueFull(QueueKind),
+    /// A queue pair still owns posted work, responder state, or completions.
+    QpBusy,
+    /// A work request would occupy an ambiguous half-space of the 24-bit PSN ring.
+    WorkRequestTooLarge {
+        /// Required packet count.
+        packets: u32,
+        /// Maximum supported outstanding packet count.
+        maximum: u32,
+    },
+    /// The endpoint clock frequency must be non-zero.
+    InvalidTicksPerSecond,
+    /// The configured generated RNR timer does not fit the five-bit AETH field.
+    InvalidRnrNakTimer(u8),
+    /// A QP path MTU cannot fit inside the endpoint's complete-packet limit.
+    PathMtuExceedsPacketLimit {
+        /// Largest complete packet required by the path MTU.
+        required: usize,
+        /// Endpoint complete-packet limit.
+        maximum: usize,
+    },
+    /// A connected QP received traffic from an unexpected IPv4 peer.
+    PeerAddressMismatch {
+        /// Packet source address.
+        source: [u8; 4],
+        /// Packet destination address.
+        destination: [u8; 4],
+    },
 }
 
 impl fmt::Display for ApiError {
@@ -104,6 +147,32 @@ impl fmt::Display for ApiError {
                 write!(formatter, "queue pair in state {state:?} cannot receive")
             }
             Self::QpState(error) => write!(formatter, "queue-pair state error: {error:?}"),
+            Self::Memory(error) => write!(formatter, "registered-memory error: {error}"),
+            Self::QueueFull(queue) => write!(formatter, "{queue:?} queue is full"),
+            Self::QpBusy => {
+                formatter.write_str("queue pair still owns pending work or completions")
+            }
+            Self::WorkRequestTooLarge { packets, maximum } => write!(
+                formatter,
+                "work request needs {packets} packets; maximum unambiguous span is {maximum}"
+            ),
+            Self::InvalidTicksPerSecond => {
+                formatter.write_str("endpoint ticks_per_second must be non-zero")
+            }
+            Self::InvalidRnrNakTimer(timer) => {
+                write!(formatter, "RNR NAK timer code {timer} exceeds five bits")
+            }
+            Self::PathMtuExceedsPacketLimit { required, maximum } => write!(
+                formatter,
+                "path MTU needs a {required}-byte packet, endpoint maximum is {maximum}"
+            ),
+            Self::PeerAddressMismatch {
+                source,
+                destination,
+            } => write!(
+                formatter,
+                "packet peer mismatch: source={source:?}, destination={destination:?}"
+            ),
         }
     }
 }
@@ -112,6 +181,7 @@ impl std::error::Error for ApiError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Wire(error) => Some(error),
+            Self::Memory(error) => Some(error),
             _ => None,
         }
     }
@@ -126,6 +196,12 @@ impl From<WireError> for ApiError {
 impl From<StateTransitionError> for ApiError {
     fn from(error: StateTransitionError) -> Self {
         Self::QpState(error)
+    }
+}
+
+impl From<MemoryError> for ApiError {
+    fn from(error: MemoryError) -> Self {
+        Self::Memory(error)
     }
 }
 

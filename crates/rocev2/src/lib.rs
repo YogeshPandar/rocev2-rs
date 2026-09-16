@@ -10,10 +10,10 @@
 //! The data path does not call libibverbs, librdmacm, UCX, or rdma-core.
 //! Connection metadata is deliberately out of band in this first release.
 //!
-//! The current endpoint exposes verified packet I/O, registered memory, QP
-//! lifecycle, and PSN bookkeeping. The posted-work executor and hardware/RXE
-//! interoperability suite remain under active implementation and are not
-//! represented as complete by this API.
+//! [`RcEndpoint`] adds fixed-capacity posted SEND, RDMA WRITE, and RDMA READ
+//! execution with completions, segmentation, ACK/NAK/RNR handling, and retry
+//! scheduling. Linux RXE and hardware interoperability remain explicit
+//! pre-1.0 qualification gates.
 
 #![forbid(unsafe_code)]
 
@@ -21,13 +21,15 @@ mod endpoint;
 mod error;
 mod packet;
 mod qp;
+mod rc;
 
 pub use endpoint::{Endpoint, EndpointConfig, EndpointStats, PollProgress};
-pub use error::{ApiError, PollError};
+pub use error::{ApiError, PollError, QueueKind};
 pub use packet::{
     DecodedPacket, Ipv4Path, MIN_ROCE_IPV4_PACKET, decode_ipv4_packet, encode_ipv4_packet,
 };
 pub use qp::QpHandle;
+pub use rc::{RcEndpoint, RcEndpointConfig, RcEndpointStats, RcProgress, RcQpConfig};
 
 pub use rocev2_core as core;
 pub use rocev2_io as io;
