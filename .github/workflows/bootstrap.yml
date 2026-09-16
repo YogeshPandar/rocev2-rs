@@ -24,7 +24,8 @@ jobs:
           set -euo pipefail
           : > /tmp/rocev2-src.tgz
           for part in .bootstrap/part-*; do
-            base64 --decode "$part" >> /tmp/rocev2-src.tgz
+            printf 'decoding %s\n' "$part"
+            tr -cd 'A-Za-z0-9+/=' < "$part" | base64 --decode >> /tmp/rocev2-src.tgz
           done
           gzip --test /tmp/rocev2-src.tgz
           tar --list --gzip --file /tmp/rocev2-src.tgz >/dev/null
