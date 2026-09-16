@@ -35,8 +35,7 @@ impl AccessFlags {
     /// Permit a peer to issue RDMA READ from the region.
     pub const REMOTE_READ: Self = Self(1 << 2);
 
-    const KNOWN_BITS: u8 =
-        Self::LOCAL_WRITE.0 | Self::REMOTE_WRITE.0 | Self::REMOTE_READ.0;
+    const KNOWN_BITS: u8 = Self::LOCAL_WRITE.0 | Self::REMOTE_WRITE.0 | Self::REMOTE_READ.0;
 
     /// Construct flags when every bit is recognized.
     #[must_use]
@@ -170,9 +169,7 @@ impl fmt::Display for MemoryError {
             Self::RegistryTooLarge => "registry capacity exceeds key format",
             Self::RegistryFull => "registered-memory table is full",
             Self::EmptyRegion => "zero-length memory region",
-            Self::RemoteWriteRequiresLocalWrite => {
-                "remote write requires local write permission"
-            }
+            Self::RemoteWriteRequiresLocalWrite => "remote write requires local write permission",
             Self::AddressOverflow => "memory address range overflow",
             Self::InvalidHandle => "invalid or stale memory-region handle",
             Self::InvalidKey => "invalid or stale memory key",
@@ -206,6 +203,7 @@ pub struct MemoryRegistry<'a, const N: usize> {
     registered: usize,
 }
 
+#[allow(unsafe_code)]
 impl<'a, const N: usize> MemoryRegistry<'a, N> {
     /// Create an empty registry using `seed` to diversify generated keys.
     pub fn new(seed: u32) -> Result<Self, MemoryError> {
@@ -251,8 +249,7 @@ impl<'a, const N: usize> MemoryRegistry<'a, N> {
         if memory.is_empty() {
             return Err(MemoryError::EmptyRegion);
         }
-        if access.contains(AccessFlags::REMOTE_WRITE)
-            && !access.contains(AccessFlags::LOCAL_WRITE)
+        if access.contains(AccessFlags::REMOTE_WRITE) && !access.contains(AccessFlags::LOCAL_WRITE)
         {
             return Err(MemoryError::RemoteWriteRequiresLocalWrite);
         }
@@ -270,10 +267,8 @@ impl<'a, const N: usize> MemoryRegistry<'a, N> {
             .checked_add(length_u64)
             .ok_or(MemoryError::AddressOverflow)?;
 
-        let slot_u32 =
-            u32::try_from(slot_index).map_err(|_| MemoryError::RegistryTooLarge)?;
-        let slot_u16 =
-            u16::try_from(slot_index).map_err(|_| MemoryError::RegistryTooLarge)?;
+        let slot_u32 = u32::try_from(slot_index).map_err(|_| MemoryError::RegistryTooLarge)?;
+        let slot_u16 = u16::try_from(slot_index).map_err(|_| MemoryError::RegistryTooLarge)?;
         let mut generation = self.generations[slot_index];
         let (lkey, rkey) = loop {
             generation = generation.wrapping_add(1).max(1);
@@ -308,10 +303,7 @@ impl<'a, const N: usize> MemoryRegistry<'a, N> {
     }
 
     /// Remove a live registration and return the original exclusive slice.
-    pub fn deregister(
-        &mut self,
-        handle: RegionHandle,
-    ) -> Result<&'a mut [u8], MemoryError> {
+    pub fn deregister(&mut self, handle: RegionHandle) -> Result<&'a mut [u8], MemoryError> {
         let index = usize::from(handle.slot);
         let slot = self
             .slots
@@ -344,8 +336,13 @@ impl<'a, const N: usize> MemoryRegistry<'a, N> {
         address: u64,
         output: &mut [u8],
     ) -> Result<(), MemoryError> {
-        let (pointer, offset) =
-            self.resolve(lkey, KeyKind::Local, AccessFlags::NONE, address, output.len())?;
+        let (pointer, offset) = self.resolve(
+            lkey,
+            KeyKind::Local,
+            AccessFlags::NONE,
+            address,
+            output.len(),
+        )?;
         // SAFETY: resolve validated key, range, overflow, and the exclusive
         // registry borrow prevents safe aliases to registered memory.
         unsafe { raw::copy_from_registered(pointer, offset, output) };
@@ -439,8 +436,7 @@ impl<'a, const N: usize> MemoryRegistry<'a, N> {
         let requested_end = address
             .checked_add(length_u64)
             .ok_or(MemoryError::AddressOverflow)?;
-        let region_length =
-            u64::try_from(slot.length).map_err(|_| MemoryError::AddressOverflow)?;
+        let region_length = u64::try_from(slot.length).map_err(|_| MemoryError::AddressOverflow)?;
         let region_end = slot
             .address
             .checked_add(region_length)
@@ -450,8 +446,8 @@ impl<'a, const N: usize> MemoryRegistry<'a, N> {
             return Err(MemoryError::RangeOutOfBounds);
         }
 
-        let offset = usize::try_from(address - slot.address)
-            .map_err(|_| MemoryError::AddressOverflow)?;
+        let offset =
+            usize::try_from(address - slot.address).map_err(|_| MemoryError::AddressOverflow)?;
         Ok((slot.pointer, offset))
     }
 }
@@ -467,8 +463,7 @@ fn make_key(seed: u32, generation: u32, slot_u32: u32, domain: u32) -> u32 {
 
     let multiplier = (mix32(seed ^ domain ^ 0xa5a5_5a5a) | 1) & TAG_MASK;
     let increment =
-        mix32(seed.rotate_left(13) ^ slot_u32.wrapping_mul(0x9e37_79b9) ^ domain)
-            & TAG_MASK;
+        mix32(seed.rotate_left(13) ^ slot_u32.wrapping_mul(0x9e37_79b9) ^ domain) & TAG_MASK;
     let tag = (generation & TAG_MASK)
         .wrapping_mul(multiplier)
         .wrapping_add(increment)

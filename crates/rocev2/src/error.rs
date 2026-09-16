@@ -65,10 +65,16 @@ impl fmt::Display for ApiError {
         match self {
             Self::Wire(error) => write!(formatter, "wire error: {error}"),
             Self::BufferTooShort { needed, actual } => {
-                write!(formatter, "buffer too short: need {needed} bytes, got {actual}")
+                write!(
+                    formatter,
+                    "buffer too short: need {needed} bytes, got {actual}"
+                )
             }
             Self::PacketTooLarge { length, maximum } => {
-                write!(formatter, "packet length {length} exceeds maximum {maximum}")
+                write!(
+                    formatter,
+                    "packet length {length} exceeds maximum {maximum}"
+                )
             }
             Self::UnsupportedMaximumPacket { requested, backend } => write!(
                 formatter,

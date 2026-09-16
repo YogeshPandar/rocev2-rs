@@ -4,11 +4,20 @@ use crate::{AETH_LEN, PSN_MASK, WireError};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AethClass {
     /// Positive acknowledgment; the lower five bits encode receive credits.
-    Ack { credit: u8 },
+    Ack {
+        /// Advertised receive credit value.
+        credit: u8,
+    },
     /// Receiver-not-ready NAK; lower five bits encode the RNR timer.
-    RnrNak { timer: u8 },
+    RnrNak {
+        /// Five-bit receiver-not-ready delay code.
+        timer: u8,
+    },
     /// Reserved syndrome class.
-    Reserved { code: u8 },
+    Reserved {
+        /// Preserved lower-five-bit syndrome value.
+        code: u8,
+    },
     /// Negative acknowledgment.
     Nak(NakCode),
 }

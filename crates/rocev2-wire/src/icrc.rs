@@ -111,7 +111,7 @@ impl Default for Icrc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Bth, Ipv4Header, Opcode, UdpHeader, IPV4_HEADER_LEN, UDP_HEADER_LEN};
+    use crate::{Bth, IPV4_HEADER_LEN, Ipv4Header, Opcode, UDP_HEADER_LEN, UdpHeader};
 
     #[test]
     fn generic_crc32_matches_standard_check_value() {

@@ -21,9 +21,9 @@ mod reth;
 pub use aeth::{Aeth, AethClass, NakCode};
 pub use bth::Bth;
 pub use error::WireError;
-pub use icrc::{Icrc, ICRC_LEN, ICRC_SEED};
-pub use ipv4::{Ipv4Header, UdpHeader, IP_PROTOCOL_UDP, IPV4_HEADER_LEN, UDP_HEADER_LEN};
-pub use opcode::{Operation, Opcode, SegmentPosition};
+pub use icrc::{ICRC_LEN, ICRC_SEED, Icrc};
+pub use ipv4::{IP_PROTOCOL_UDP, IPV4_HEADER_LEN, Ipv4Header, UDP_HEADER_LEN, UdpHeader};
+pub use opcode::{Opcode, Operation, SegmentPosition};
 pub use packet::{PacketRef, PacketSpec, ParseOptions};
 pub use reth::Reth;
 

@@ -100,9 +100,7 @@ impl QpConfig {
             return Err(StateTransitionError::InvalidRemoteQpn(self.remote_qpn));
         }
         if self.retry_count > MAX_RETRY_COUNT {
-            return Err(StateTransitionError::InvalidRetryCount(
-                self.retry_count,
-            ));
+            return Err(StateTransitionError::InvalidRetryCount(self.retry_count));
         }
         if self.rnr_retry_count > MAX_RETRY_COUNT {
             return Err(StateTransitionError::InvalidRnrRetryCount(
@@ -187,10 +185,7 @@ impl QpStateMachine {
     }
 
     /// Replace configuration while the queue pair is reset.
-    pub const fn reconfigure(
-        &mut self,
-        config: QpConfig,
-    ) -> Result<(), StateTransitionError> {
+    pub const fn reconfigure(&mut self, config: QpConfig) -> Result<(), StateTransitionError> {
         if !matches!(self.state, QpState::Reset) {
             return Err(StateTransitionError::ReconfigureWhileActive(self.state));
         }
@@ -204,10 +199,7 @@ impl QpStateMachine {
     }
 
     /// Move the queue pair to another state after validating the transition.
-    pub const fn transition(
-        &mut self,
-        destination: QpState,
-    ) -> Result<(), StateTransitionError> {
+    pub const fn transition(&mut self, destination: QpState) -> Result<(), StateTransitionError> {
         if is_legal_transition(self.state, destination) {
             self.state = destination;
             Ok(())
@@ -237,7 +229,10 @@ const fn is_legal_transition(from: QpState, to: QpState) -> bool {
     matches!(
         (from, to),
         (QpState::Reset, QpState::Init | QpState::Error)
-            | (QpState::Init, QpState::Reset | QpState::Rtr | QpState::Error)
+            | (
+                QpState::Init,
+                QpState::Reset | QpState::Rtr | QpState::Error
+            )
             | (QpState::Rtr, QpState::Reset | QpState::Rts | QpState::Error)
             | (
                 QpState::Rts,

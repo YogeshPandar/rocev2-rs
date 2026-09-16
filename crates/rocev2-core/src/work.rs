@@ -81,13 +81,7 @@ impl WorkRequest {
 
     /// Create an RDMA WRITE work request.
     #[must_use]
-    pub const fn write(
-        id: u64,
-        sge: Sge,
-        remote_address: u64,
-        rkey: u32,
-        signaled: bool,
-    ) -> Self {
+    pub const fn write(id: u64, sge: Sge, remote_address: u64, rkey: u32, signaled: bool) -> Self {
         Self {
             id,
             kind: WorkRequestKind::RdmaWrite {
@@ -101,13 +95,7 @@ impl WorkRequest {
 
     /// Create an RDMA READ work request.
     #[must_use]
-    pub const fn read(
-        id: u64,
-        sge: Sge,
-        remote_address: u64,
-        rkey: u32,
-        signaled: bool,
-    ) -> Self {
+    pub const fn read(id: u64, sge: Sge, remote_address: u64, rkey: u32, signaled: bool) -> Self {
         Self {
             id,
             kind: WorkRequestKind::RdmaRead {
@@ -189,11 +177,7 @@ pub struct Completion {
 impl Completion {
     /// Create a successful completion.
     #[must_use]
-    pub const fn success(
-        work_request_id: u64,
-        opcode: CompletionOpcode,
-        byte_len: u32,
-    ) -> Self {
+    pub const fn success(work_request_id: u64, opcode: CompletionOpcode, byte_len: u32) -> Self {
         Self {
             work_request_id,
             opcode,

@@ -84,7 +84,10 @@ impl fmt::Display for WireError {
             }
             Self::NonZeroPadding => f.write_str("packet contains non-zero pad bytes"),
             Self::IcrcMismatch { wire, computed } => {
-                write!(f, "ICRC mismatch: wire=0x{wire:08x}, computed=0x{computed:08x}")
+                write!(
+                    f,
+                    "ICRC mismatch: wire=0x{wire:08x}, computed=0x{computed:08x}"
+                )
             }
             Self::InvalidIpv4Header => f.write_str("invalid IPv4 header"),
             Self::UnsupportedIpv4Options => f.write_str("IPv4 options are not supported"),
@@ -92,3 +95,5 @@ impl fmt::Display for WireError {
         }
     }
 }
+
+impl core::error::Error for WireError {}

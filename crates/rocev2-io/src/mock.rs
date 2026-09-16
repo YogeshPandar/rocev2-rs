@@ -67,7 +67,10 @@ impl fmt::Display for MockIoError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::PacketTooLarge { length, maximum } => {
-                write!(formatter, "packet length {length} exceeds maximum {maximum}")
+                write!(
+                    formatter,
+                    "packet length {length} exceeds maximum {maximum}"
+                )
             }
             Self::OutputTooSmall {
                 required,
@@ -108,8 +111,7 @@ impl MockIo {
     /// Queue one packet for the next receive operation.
     pub fn inject_receive(&mut self, packet: &[u8]) -> Result<(), MockIoError> {
         self.validate_length(packet.len())?;
-        self.receive_queue
-            .push_back(Frame::copy_from_slice(packet));
+        self.receive_queue.push_back(Frame::copy_from_slice(packet));
         Ok(())
     }
 

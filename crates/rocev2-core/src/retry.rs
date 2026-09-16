@@ -4,9 +4,9 @@ const UNLIMITED_RETRY_CODE: u8 = 7;
 const MAX_RETRY_CODE: u8 = 7;
 
 const RNR_TIMER_MICROSECONDS: [u64; 32] = [
-    655_360, 10, 20, 30, 40, 60, 80, 120, 160, 240, 320, 480, 640, 960, 1_280,
-    1_920, 2_560, 3_840, 5_120, 7_680, 10_240, 15_360, 20_480, 30_720, 40_960,
-    61_440, 81_920, 122_880, 163_840, 245_760, 327_680, 491_520,
+    655_360, 10, 20, 30, 40, 60, 80, 120, 160, 240, 320, 480, 640, 960, 1_280, 1_920, 2_560, 3_840,
+    5_120, 7_680, 10_240, 15_360, 20_480, 30_720, 40_960, 61_440, 81_920, 122_880, 163_840,
+    245_760, 327_680, 491_520,
 ];
 
 /// Cause consuming an RC retry budget.
@@ -47,11 +47,7 @@ pub struct RetryPolicy {
 impl RetryPolicy {
     /// Construct a policy when both three-bit retry fields are valid.
     #[must_use]
-    pub const fn new(
-        retry_count: u8,
-        rnr_retry_count: u8,
-        timeout_ticks: u64,
-    ) -> Option<Self> {
+    pub const fn new(retry_count: u8, rnr_retry_count: u8, timeout_ticks: u64) -> Option<Self> {
         if retry_count <= MAX_RETRY_CODE && rnr_retry_count <= MAX_RETRY_CODE {
             Some(Self {
                 retry_count,
@@ -110,11 +106,7 @@ impl RetryBudget {
     /// Charge one failure and decide whether the operation may be retried.
     ///
     /// `rnr_delay_ticks` is ignored for timeout failures.
-    pub const fn on_failure(
-        &mut self,
-        reason: RetryReason,
-        rnr_delay_ticks: u64,
-    ) -> RetryDecision {
+    pub const fn on_failure(&mut self, reason: RetryReason, rnr_delay_ticks: u64) -> RetryDecision {
         match reason {
             RetryReason::Timeout => {
                 if self.policy.retry_count == UNLIMITED_RETRY_CODE {

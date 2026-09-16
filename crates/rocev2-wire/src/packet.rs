@@ -1,4 +1,4 @@
-use crate::{AETH_LEN, Aeth, BTH_LEN, Bth, ICRC_LEN, Icrc, Opcode, RETH_LEN, Reth, WireError};
+use crate::{AETH_LEN, Aeth, BTH_LEN, Bth, ICRC_LEN, Icrc, RETH_LEN, Reth, WireError};
 
 /// Parser strictness controls.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -306,7 +306,7 @@ impl<'a> PacketSpec<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Ipv4Header, UdpHeader, IPV4_HEADER_LEN, ROCE_V2_UDP_PORT, UDP_HEADER_LEN};
+    use crate::{IPV4_HEADER_LEN, Ipv4Header, Opcode, ROCE_V2_UDP_PORT, UDP_HEADER_LEN, UdpHeader};
 
     #[test]
     fn write_only_roundtrip_and_icrc() {

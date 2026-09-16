@@ -276,9 +276,7 @@ mod tests {
         let mut packet = valid_packet();
         packet[3] = 19;
         assert_eq!(
-            validate_outgoing_packet(&packet, 1500)
-                .unwrap_err()
-                .kind(),
+            validate_outgoing_packet(&packet, 1500).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
     }

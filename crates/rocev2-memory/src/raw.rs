@@ -22,14 +22,14 @@ pub(crate) unsafe fn slice_from_raw_parts_mut<'a>(
 ///
 /// `pointer.add(offset)..+output.len()` must be readable and must not overlap
 /// `output`.
-pub(crate) unsafe fn copy_from_registered(
-    pointer: NonNull<u8>,
-    offset: usize,
-    output: &mut [u8],
-) {
+pub(crate) unsafe fn copy_from_registered(pointer: NonNull<u8>, offset: usize, output: &mut [u8]) {
     // SAFETY: guaranteed by the caller contract after range validation.
     unsafe {
-        ptr::copy_nonoverlapping(pointer.as_ptr().add(offset), output.as_mut_ptr(), output.len())
+        ptr::copy_nonoverlapping(
+            pointer.as_ptr().add(offset),
+            output.as_mut_ptr(),
+            output.len(),
+        )
     };
 }
 
@@ -39,13 +39,7 @@ pub(crate) unsafe fn copy_from_registered(
 ///
 /// `pointer.add(offset)..+input.len()` must be writable and must not overlap
 /// `input`.
-pub(crate) unsafe fn copy_to_registered(
-    pointer: NonNull<u8>,
-    offset: usize,
-    input: &[u8],
-) {
+pub(crate) unsafe fn copy_to_registered(pointer: NonNull<u8>, offset: usize, input: &[u8]) {
     // SAFETY: guaranteed by the caller contract after range validation.
-    unsafe {
-        ptr::copy_nonoverlapping(input.as_ptr(), pointer.as_ptr().add(offset), input.len())
-    };
+    unsafe { ptr::copy_nonoverlapping(input.as_ptr(), pointer.as_ptr().add(offset), input.len()) };
 }

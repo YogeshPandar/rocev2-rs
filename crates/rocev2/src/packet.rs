@@ -85,9 +85,7 @@ pub fn decode_ipv4_packet(input: &[u8]) -> Result<DecodedPacket<'_>, ApiError> {
     let udp_bytes = &input[udp_start..transport_start];
     let udp = UdpHeader::decode(udp_bytes)?;
     if udp.destination_port != ROCE_V2_UDP_PORT {
-        return Err(ApiError::InvalidRoceDestinationPort(
-            udp.destination_port,
-        ));
+        return Err(ApiError::InvalidRoceDestinationPort(udp.destination_port));
     }
 
     let actual_udp_length = ipv4_length
@@ -133,11 +131,10 @@ pub fn encode_ipv4_packet(
         length: total_length,
         maximum: usize::from(u16::MAX),
     })?;
-    let total_length_u16 =
-        u16::try_from(total_length).map_err(|_| ApiError::PacketTooLarge {
-            length: total_length,
-            maximum: usize::from(u16::MAX),
-        })?;
+    let total_length_u16 = u16::try_from(total_length).map_err(|_| ApiError::PacketTooLarge {
+        length: total_length,
+        maximum: usize::from(u16::MAX),
+    })?;
 
     if output.len() < total_length {
         return Err(ApiError::BufferTooShort {

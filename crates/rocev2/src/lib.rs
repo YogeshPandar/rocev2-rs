@@ -25,8 +25,7 @@ mod qp;
 pub use endpoint::{Endpoint, EndpointConfig, EndpointStats, PollProgress};
 pub use error::{ApiError, PollError};
 pub use packet::{
-    DecodedPacket, Ipv4Path, MIN_ROCE_IPV4_PACKET, decode_ipv4_packet,
-    encode_ipv4_packet,
+    DecodedPacket, Ipv4Path, MIN_ROCE_IPV4_PACKET, decode_ipv4_packet, encode_ipv4_packet,
 };
 pub use qp::QpHandle;
 
@@ -39,9 +38,7 @@ pub use rocev2_core::{
     Completion, CompletionOpcode, CompletionStatus, PathMtu, Psn, QpConfig, QpState,
     RecvWorkRequest, Sge, WorkRequest, WorkRequestKind,
 };
-pub use rocev2_memory::{
-    AccessFlags, MemoryError, MemoryRegistry, RegionHandle, RemoteMemory,
-};
+pub use rocev2_memory::{AccessFlags, MemoryError, MemoryRegistry, RegionHandle, RemoteMemory};
 
 /// Compatibility name for registered-memory access rights.
 pub type Access = AccessFlags;

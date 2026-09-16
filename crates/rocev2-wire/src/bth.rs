@@ -178,7 +178,9 @@ mod tests {
         bth.encode(&mut bytes).unwrap();
         assert_eq!(
             bytes,
-            [0x0a, 0xa0, 0xff, 0xff, 0x80, 0x12, 0x34, 0x56, 0x80, 0xab, 0xcd, 0xef]
+            [
+                0x0a, 0xa0, 0xff, 0xff, 0x80, 0x12, 0x34, 0x56, 0x80, 0xab, 0xcd, 0xef
+            ]
         );
         assert_eq!(Bth::decode(&bytes).unwrap(), bth);
     }
@@ -186,13 +188,14 @@ mod tests {
     #[test]
     fn reserved_bits_are_rejected() {
         let mut bytes = [0_u8; BTH_LEN];
-        Bth::new(Opcode::SendOnly, 1, 2)
-            .encode(&mut bytes)
-            .unwrap();
+        Bth::new(Opcode::SendOnly, 1, 2).encode(&mut bytes).unwrap();
         bytes[4] |= 0x01;
         assert!(matches!(
             Bth::decode(&bytes),
-            Err(WireError::ReservedBitsSet { field: "BTH.qpn", .. })
+            Err(WireError::ReservedBitsSet {
+                field: "BTH.qpn",
+                ..
+            })
         ));
     }
 }

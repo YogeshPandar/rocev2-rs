@@ -5,8 +5,7 @@ use crate::{
     decode_ipv4_packet, encode_ipv4_packet,
 };
 use rocev2_core::{
-    AckAdvance, Psn, QpConfig, QpState, QpStateMachine, ReceiveDisposition, ReceivePsn,
-    SendWindow,
+    AckAdvance, Psn, QpConfig, QpState, QpStateMachine, ReceiveDisposition, ReceivePsn, SendWindow,
 };
 use rocev2_io::PacketIo;
 use rocev2_wire::{Opcode, PacketSpec};
@@ -145,9 +144,12 @@ where
 
     /// Create a validated queue pair in RESET state.
     pub fn create_qp(&mut self, config: QpConfig) -> Result<QpHandle, ApiError> {
-        if self.qps.iter().flatten().any(|slot| {
-            slot.machine.config().local_qpn == config.local_qpn
-        }) {
+        if self
+            .qps
+            .iter()
+            .flatten()
+            .any(|slot| slot.machine.config().local_qpn == config.local_qpn)
+        {
             return Err(ApiError::DuplicateLocalQpn(config.local_qpn));
         }
 
@@ -204,11 +206,7 @@ where
     }
 
     /// Replace queue-pair configuration while it remains in RESET.
-    pub fn reconfigure_qp(
-        &mut self,
-        handle: QpHandle,
-        config: QpConfig,
-    ) -> Result<(), ApiError> {
+    pub fn reconfigure_qp(&mut self, handle: QpHandle, config: QpConfig) -> Result<(), ApiError> {
         if self.qps.iter().flatten().any(|slot| {
             slot.machine.config().local_qpn == config.local_qpn
                 && slot.generation != handle.generation()
@@ -353,8 +351,7 @@ where
         };
         if !slot.machine.can_receive() {
             let state = slot.machine.state();
-            self.stats.qp_not_ready_packets =
-                self.stats.qp_not_ready_packets.saturating_add(1);
+            self.stats.qp_not_ready_packets = self.stats.qp_not_ready_packets.saturating_add(1);
             return Err(ApiError::QpNotReady(state).into());
         }
 
@@ -385,9 +382,7 @@ where
 
     fn qp_slot_mut(&mut self, handle: QpHandle) -> Result<&mut QpSlot, ApiError> {
         let index = self.qp_index(handle)?;
-        self.qps[index]
-            .as_mut()
-            .ok_or(ApiError::InvalidQpHandle)
+        self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)
     }
 }
 

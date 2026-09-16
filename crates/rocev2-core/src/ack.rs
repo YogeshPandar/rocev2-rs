@@ -134,16 +134,11 @@ impl SendWindow {
             return AckAdvance::Duplicate;
         }
 
-        if !matches!(
-            acknowledged.compare(self.next_to_send),
-            PsnOrdering::Before
-        ) {
+        if !matches!(acknowledged.compare(self.next_to_send), PsnOrdering::Before) {
             return AckAdvance::Invalid;
         }
 
-        let packets = acknowledged
-            .forward_distance_from(self.oldest_unacknowledged)
-            + 1;
+        let packets = acknowledged.forward_distance_from(self.oldest_unacknowledged) + 1;
         self.oldest_unacknowledged = acknowledged.next();
         AckAdvance::Advanced {
             packets,

@@ -161,7 +161,7 @@ impl UdpHeader {
 }
 
 /// Compute the RFC 1071 Internet checksum.
-pub fn internet_checksum(bytes: &[u8]) -> u16 {
+pub(crate) fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0_u32;
     let mut chunks = bytes.chunks_exact(2);
     for chunk in &mut chunks {
