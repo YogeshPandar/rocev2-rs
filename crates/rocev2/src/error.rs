@@ -94,6 +94,8 @@ pub enum ApiError {
     },
     /// The endpoint clock frequency must be non-zero.
     InvalidTicksPerSecond,
+    /// A packet backend violated the documented batch ownership contract.
+    PacketIoContractViolation,
     /// The configured generated RNR timer does not fit the five-bit AETH field.
     InvalidRnrNakTimer(u8),
     /// A QP path MTU cannot fit inside the endpoint's complete-packet limit.
@@ -175,6 +177,9 @@ impl fmt::Display for ApiError {
             ),
             Self::InvalidTicksPerSecond => {
                 formatter.write_str("endpoint ticks_per_second must be non-zero")
+            }
+            Self::PacketIoContractViolation => {
+                formatter.write_str("packet backend violated the batch ownership contract")
             }
             Self::InvalidRnrNakTimer(timer) => {
                 write!(formatter, "RNR NAK timer code {timer} exceeds five bits")

@@ -16,7 +16,7 @@ use rocev2_core::{
     RecvWorkRequest, RetryBudget, RetryDecision, RetryPolicy, RetryReason, Ring, SendWindow, Timer,
     TimerEntry, TimerScheduler, WorkRequest, WorkRequestKind, ack_timeout_ticks, rnr_timer_ticks,
 };
-use rocev2_io::PacketIo;
+use rocev2_io::{PacketBatchIo, PacketIo, TxPacket};
 use rocev2_memory::{AccessFlags, MemoryError, MemoryRegistry, RegionHandle};
 use rocev2_wire::{
     AETH_LEN, Aeth, AethClass, BTH_LEN, Bth, ICRC_LEN, IPV4_HEADER_LEN, NakCode, Opcode, PacketRef,
@@ -25,6 +25,9 @@ use rocev2_wire::{
 
 const MAX_MTU_BYTES: usize = 4096;
 const MAX_RNR_TIMER: u8 = 31;
+
+/// maximum packet burst accepted by [`RcEndpoint::progress_batch`].
+pub const MAX_BATCH_PACKETS: usize = 64;
 
 /// Configuration for the posted-work RC engine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -398,7 +401,7 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ControlReply {
     path: Ipv4Path,
     destination_qpn: u32,
@@ -421,6 +424,54 @@ struct ReadyReadResponse {
     response: ReadResponseState,
     message_sequence_number: Psn,
     mtu: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreparedWirePacket {
+    path: Ipv4Path,
+    bth: Bth,
+    reth: Option<Reth>,
+    aeth: Option<Aeth>,
+    payload_length: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PreparedTx {
+    Control(ControlReply),
+    Requester {
+        qp_index: usize,
+        timeout_ticks: u64,
+        next_class: DataTxClass,
+    },
+    Responder {
+        qp_index: usize,
+        next_class: DataTxClass,
+    },
+}
+
+impl PreparedTx {
+    const fn qp_index(self) -> Option<usize> {
+        match self {
+            Self::Control(_) => None,
+            Self::Requester { qp_index, .. } | Self::Responder { qp_index, .. } => Some(qp_index),
+        }
+    }
+}
+
+struct BatchTxBuffers<F> {
+    frames: [Option<F>; MAX_BATCH_PACKETS],
+    packets: [TxPacket<F>; MAX_BATCH_PACKETS],
+    metadata: [Option<PreparedTx>; MAX_BATCH_PACKETS],
+}
+
+impl<F> Default for BatchTxBuffers<F> {
+    fn default() -> Self {
+        Self {
+            frames: core::array::from_fn(|_| None),
+            packets: core::array::from_fn(|_| TxPacket::empty()),
+            metadata: [None; MAX_BATCH_PACKETS],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -468,6 +519,7 @@ pub struct RcEndpoint<
     requester_ready: ReadyQueue<QPS>,
     responder_ready: ReadyQueue<QPS>,
     timer_scheduler: TimerScheduler<QPS>,
+    pending_control: Ring<ControlReply, MAX_BATCH_PACKETS>,
     next_data_tx_class: DataTxClass,
 }
 
@@ -515,6 +567,7 @@ where
             requester_ready: ReadyQueue::new(),
             responder_ready: ReadyQueue::new(),
             timer_scheduler: TimerScheduler::new(),
+            pending_control: Ring::new(),
             next_data_tx_class: DataTxClass::Responder,
         })
     }
@@ -721,34 +774,7 @@ where
             return Err(ApiError::QpNotReady(state));
         }
 
-        let packets = packet_count(work.sge.length, mtu);
-        if packets > MAX_OUTSTANDING_PACKETS {
-            return Err(ApiError::WorkRequestTooLarge {
-                packets,
-                maximum: MAX_OUTSTANDING_PACKETS,
-            });
-        }
-        let length = usize::try_from(work.sge.length).map_err(|_| ApiError::ArithmeticOverflow)?;
-        match work.kind {
-            WorkRequestKind::Send => {
-                self.memory
-                    .validate_local_read(work.sge.lkey, work.sge.address, length)?;
-            }
-            WorkRequestKind::RdmaWrite { remote_address, .. } => {
-                self.memory
-                    .validate_local_read(work.sge.lkey, work.sge.address, length)?;
-                remote_address
-                    .checked_add(u64::from(work.sge.length))
-                    .ok_or(ApiError::ArithmeticOverflow)?;
-            }
-            WorkRequestKind::RdmaRead { remote_address, .. } => {
-                self.memory
-                    .validate_local_write(work.sge.lkey, work.sge.address, length)?;
-                remote_address
-                    .checked_add(u64::from(work.sge.length))
-                    .ok_or(ApiError::ArithmeticOverflow)?;
-            }
-        }
+        validate_posted_work(&self.memory, work, mtu)?;
 
         {
             let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
@@ -766,6 +792,59 @@ where
         self.synchronize_qp(index);
         self.stats.posted_work_requests = self.stats.posted_work_requests.saturating_add(1);
         Ok(())
+    }
+
+    /// Post a batch of SEND, RDMA WRITE, or RDMA READ work requests atomically.
+    ///
+    /// validation and capacity checks complete before any request is accepted.
+    pub fn post_work_batch(
+        &mut self,
+        handle: QpHandle,
+        works: &[WorkRequest],
+    ) -> Result<usize, ApiError> {
+        if works.is_empty() {
+            return Ok(0);
+        }
+        let index = self.qp_index(handle)?;
+        let (state, mtu, send_capacity, completion_capacity) = {
+            let slot = self.qps[index].as_ref().ok_or(ApiError::InvalidQpHandle)?;
+            (
+                slot.machine.state(),
+                slot.machine.config().path_mtu.bytes(),
+                slot.send_queue.remaining_capacity(),
+                CQ.saturating_sub(
+                    slot.completion_queue
+                        .len()
+                        .saturating_add(slot.completion_reservations),
+                ),
+            )
+        };
+        if !matches!(state, QpState::Rts) {
+            return Err(ApiError::QpNotReady(state));
+        }
+        if works.len() > send_capacity {
+            return Err(ApiError::QueueFull(QueueKind::Send));
+        }
+        if works.len() > completion_capacity {
+            return Err(ApiError::QueueFull(QueueKind::Completion));
+        }
+
+        for work in works {
+            validate_posted_work(&self.memory, *work, mtu)?;
+        }
+
+        let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
+        slot.completion_reservations += works.len();
+        for work in works {
+            let pushed = slot.send_queue.push(*work);
+            debug_assert!(pushed.is_ok());
+        }
+        self.synchronize_qp(index);
+        self.stats.posted_work_requests = self
+            .stats
+            .posted_work_requests
+            .saturating_add(u64::try_from(works.len()).unwrap_or(u64::MAX));
+        Ok(works.len())
     }
 
     /// Post one receive WQE for an incoming two-sided SEND.
@@ -805,9 +884,83 @@ where
         Ok(())
     }
 
+    /// Post a batch of receive WQEs atomically.
+    ///
+    /// validation and capacity checks complete before any receive is accepted.
+    pub fn post_receive_batch(
+        &mut self,
+        handle: QpHandle,
+        works: &[RecvWorkRequest],
+    ) -> Result<usize, ApiError> {
+        if works.is_empty() {
+            return Ok(0);
+        }
+        let index = self.qp_index(handle)?;
+        let (state, receive_capacity, completion_capacity) = {
+            let slot = self.qps[index].as_ref().ok_or(ApiError::InvalidQpHandle)?;
+            (
+                slot.machine.state(),
+                slot.receive_queue.remaining_capacity(),
+                CQ.saturating_sub(
+                    slot.completion_queue
+                        .len()
+                        .saturating_add(slot.completion_reservations),
+                ),
+            )
+        };
+        if !matches!(
+            state,
+            QpState::Rtr | QpState::Rts | QpState::Sqd | QpState::Sqe
+        ) {
+            return Err(ApiError::QpNotReady(state));
+        }
+        if works.len() > receive_capacity {
+            return Err(ApiError::QueueFull(QueueKind::Receive));
+        }
+        if works.len() > completion_capacity {
+            return Err(ApiError::QueueFull(QueueKind::Completion));
+        }
+        for work in works {
+            let length =
+                usize::try_from(work.sge.length).map_err(|_| ApiError::ArithmeticOverflow)?;
+            self.memory
+                .validate_local_write(work.sge.lkey, work.sge.address, length)?;
+        }
+
+        let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
+        slot.completion_reservations += works.len();
+        for work in works {
+            let pushed = slot.receive_queue.push(*work);
+            debug_assert!(pushed.is_ok());
+        }
+        self.stats.posted_receive_requests = self
+            .stats
+            .posted_receive_requests
+            .saturating_add(u64::try_from(works.len()).unwrap_or(u64::MAX));
+        Ok(works.len())
+    }
+
     /// Remove the oldest completion for a QP.
     pub fn poll_completion(&mut self, handle: QpHandle) -> Result<Option<Completion>, ApiError> {
         Ok(self.qp_slot_mut(handle)?.completion_queue.pop())
+    }
+
+    /// Poll up to `output.len()` completions without allocation.
+    pub fn poll_completions(
+        &mut self,
+        handle: QpHandle,
+        output: &mut [Completion],
+    ) -> Result<usize, ApiError> {
+        let slot = self.qp_slot_mut(handle)?;
+        let mut count = 0;
+        for destination in output {
+            let Some(completion) = slot.completion_queue.pop() else {
+                break;
+            };
+            *destination = completion;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Return the current number of queued completions.
@@ -830,9 +983,14 @@ where
         self.validate_poll_buffers(receive_buffer, transmit_buffer)?;
         let mut progress = RcProgress::default();
 
-        let timer_result = self.service_timers(now);
+        let timer_result = self.service_timers(now, 1);
         progress.completions += timer_result.completions;
         progress.retransmissions += timer_result.retransmissions;
+
+        if self.transmit_pending_control(transmit_buffer)? {
+            progress.transmitted_packets = 1;
+            return Ok(progress);
+        }
 
         if let Some(decoded) = self.receive_one(receive_buffer)? {
             progress.received_packets = 1;
@@ -840,9 +998,12 @@ where
             progress.completions += result.completions;
             progress.retransmissions += result.retransmissions;
             if let Some(reply) = result.reply {
-                self.transmit_control(reply, transmit_buffer)?;
-                progress.transmitted_packets = 1;
-                return Ok(progress);
+                let queued = self.pending_control.push(reply);
+                debug_assert!(queued.is_ok());
+                if self.transmit_pending_control(transmit_buffer)? {
+                    progress.transmitted_packets = 1;
+                    return Ok(progress);
+                }
             }
         }
 
@@ -949,58 +1110,34 @@ where
         now: u64,
         decoded: DecodedPacket<'_>,
     ) -> Result<HandlerResult, ApiError> {
-        let destination_qpn = decoded.transport.bth.destination_qpn;
-        let Some(index) = qpn_slot(&self.qpn_index, destination_qpn) else {
-            self.stats.unknown_qp_packets = self.stats.unknown_qp_packets.saturating_add(1);
-            return Err(ApiError::UnknownDestinationQpn(destination_qpn));
-        };
-
-        let peer_matches = {
-            let slot = self
-                .qps
-                .get(index)
-                .and_then(Option::as_ref)
-                .ok_or(ApiError::InvalidQpHandle)?;
-            decoded.ipv4.source == slot.path.destination
-                && decoded.ipv4.destination == slot.path.source
-        };
-        if !peer_matches {
-            self.stats.peer_mismatch_packets = self.stats.peer_mismatch_packets.saturating_add(1);
-            return Err(ApiError::PeerAddressMismatch {
-                source: decoded.ipv4.source,
-                destination: decoded.ipv4.destination,
-            });
-        }
-
-        let result = {
-            let slot = self
-                .qps
-                .get_mut(index)
-                .and_then(Option::as_mut)
-                .ok_or(ApiError::InvalidQpHandle)?;
-            if !slot.machine.can_receive() {
-                return Err(ApiError::QpNotReady(slot.machine.state()));
-            }
-
-            if decoded.transport.bth.opcode.is_request() {
-                handle_request_packet(slot, &mut self.memory, decoded.transport, &mut self.stats)
-            } else {
-                handle_response_packet(
-                    slot,
-                    &mut self.memory,
-                    decoded.transport,
-                    now,
-                    self.config.ticks_per_second,
-                    &mut self.stats,
-                )
-            }
-        };
+        let (index, result) = process_incoming_state(
+            &self.qpn_index,
+            &mut self.qps,
+            &mut self.memory,
+            &mut self.stats,
+            self.config.ticks_per_second,
+            now,
+            decoded,
+        )?;
         self.synchronize_qp(index);
         self.stats.completions = self
             .stats
             .completions
             .saturating_add(u64::try_from(result.completions).unwrap_or(u64::MAX));
         Ok(result)
+    }
+
+    fn transmit_pending_control(
+        &mut self,
+        output: &mut [u8],
+    ) -> Result<bool, PollError<Io::Error>> {
+        let Some(reply) = self.pending_control.front().copied() else {
+            return Ok(false);
+        };
+        self.transmit_control(reply, output)?;
+        let removed = self.pending_control.pop();
+        debug_assert!(removed.is_some());
+        Ok(true)
     }
 
     fn transmit_control(
@@ -1027,25 +1164,18 @@ where
             packet,
             output,
         )?;
-        match reply.aeth.class() {
-            AethClass::Ack { .. } => {
-                self.stats.acknowledgements = self.stats.acknowledgements.saturating_add(1);
-            }
-            AethClass::RnrNak { .. } => {
-                self.stats.rnr_naks = self.stats.rnr_naks.saturating_add(1);
-            }
-            AethClass::Nak(_) | AethClass::Reserved { .. } => {
-                self.stats.negative_acknowledgements =
-                    self.stats.negative_acknowledgements.saturating_add(1);
-            }
-        }
+        self.record_control_transmit(reply);
         Ok(())
     }
 
-    fn service_timers(&mut self, now: u64) -> HandlerResult {
+    fn service_timers(&mut self, now: u64, budget: usize) -> HandlerResult {
         let mut result = HandlerResult::default();
+        let mut serviced = 0;
 
-        while let Some(entry) = self.timer_scheduler.pop_expired(now) {
+        while serviced < budget {
+            let Some(entry) = self.timer_scheduler.pop_expired(now) else {
+                break;
+            };
             let Ok(index) = usize::try_from(entry.qp_slot()) else {
                 continue;
             };
@@ -1098,7 +1228,7 @@ where
                 }
             }
             self.synchronize_qp(index);
-            break;
+            serviced += 1;
         }
 
         self.stats.completions = self
@@ -1327,6 +1457,219 @@ where
         })
     }
 
+    fn prepare_requester_batch(
+        &mut self,
+        next_class: DataTxClass,
+    ) -> Result<(Option<(PreparedWirePacket, PreparedTx)>, usize), ApiError> {
+        let mut generated = 0;
+
+        while let Some(index) = self.requester_ready.pop() {
+            let Some(slot) = self.qps.get_mut(index).and_then(Option::as_mut) else {
+                continue;
+            };
+            slot.requester_scheduled = false;
+            start_next_request(slot, self.config.ticks_per_second);
+            let Some(active) = slot.active_request else {
+                self.synchronize_qp(index);
+                continue;
+            };
+            if !matches!(active.phase, RequestPhase::Sending) {
+                self.synchronize_qp(index);
+                continue;
+            }
+
+            let config = slot.machine.config();
+            let path = slot.path;
+            let timeout_ticks = ack_timeout_ticks(config.timeout, self.config.ticks_per_second)
+                .ok_or(ApiError::InvalidTicksPerSecond)?;
+            let packet = match build_request_packet(
+                &mut self.memory,
+                &mut self.payload_scratch,
+                active,
+                config.path_mtu.bytes(),
+                config.remote_qpn,
+            ) {
+                Ok(packet) => packet,
+                Err(RequestPacketError::ArithmeticOverflow) => {
+                    self.synchronize_qp(index);
+                    self.stats.completions = self
+                        .stats
+                        .completions
+                        .saturating_add(u64::try_from(generated).unwrap_or(u64::MAX));
+                    return Err(ApiError::ArithmeticOverflow);
+                }
+                Err(RequestPacketError::LocalProtection) => {
+                    generated += fail_active_and_error(
+                        self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?,
+                        CompletionStatus::LocalProtectionError,
+                    );
+                    self.synchronize_qp(index);
+                    continue;
+                }
+            };
+            let prepared = PreparedWirePacket {
+                path,
+                bth: packet.bth,
+                reth: packet.reth,
+                aeth: packet.aeth,
+                payload_length: packet.payload.len(),
+            };
+            self.stats.completions = self
+                .stats
+                .completions
+                .saturating_add(u64::try_from(generated).unwrap_or(u64::MAX));
+            return Ok((
+                Some((
+                    prepared,
+                    PreparedTx::Requester {
+                        qp_index: index,
+                        timeout_ticks,
+                        next_class,
+                    },
+                )),
+                generated,
+            ));
+        }
+
+        self.stats.completions = self
+            .stats
+            .completions
+            .saturating_add(u64::try_from(generated).unwrap_or(u64::MAX));
+        Ok((None, generated))
+    }
+
+    fn prepare_read_response_batch(
+        &mut self,
+        next_class: DataTxClass,
+    ) -> Result<(Option<(PreparedWirePacket, PreparedTx)>, usize), ApiError> {
+        let mut generated = 0;
+        loop {
+            let Some(ready) = self.dequeue_read_response() else {
+                return Ok((None, generated));
+            };
+            let (address, payload_length) = match read_response_segment(ready.response, ready.mtu) {
+                Ok(segment) => segment,
+                Err(error) => {
+                    self.synchronize_qp(ready.qp_index);
+                    return Err(error);
+                }
+            };
+            if self
+                .memory
+                .read_remote(
+                    ready.response.rkey,
+                    address,
+                    &mut self.payload_scratch[..payload_length],
+                )
+                .is_err()
+            {
+                let failed = self.fail_read_responder(ready.qp_index);
+                generated = generated.saturating_add(failed.completions);
+                continue;
+            }
+
+            let opcode = segmented_opcode(
+                TransferDirection::ReadResponse,
+                ready.response.next_packet,
+                ready.response.packet_count,
+            );
+            return Ok((
+                Some((
+                    PreparedWirePacket {
+                        path: ready.path,
+                        bth: Bth::new(
+                            opcode,
+                            ready.remote_qpn,
+                            ready
+                                .response
+                                .request_psn
+                                .wrapping_add(ready.response.next_packet)
+                                .value(),
+                        ),
+                        reth: None,
+                        aeth: opcode
+                            .has_aeth()
+                            .then(|| Aeth::ack(ready.message_sequence_number.value())),
+                        payload_length,
+                    },
+                    PreparedTx::Responder {
+                        qp_index: ready.qp_index,
+                        next_class,
+                    },
+                )),
+                generated,
+            ));
+        }
+    }
+
+    fn prepare_data_class_batch(
+        &mut self,
+        class: DataTxClass,
+        next_class: DataTxClass,
+    ) -> Result<(Option<(PreparedWirePacket, PreparedTx)>, usize), ApiError> {
+        match class {
+            DataTxClass::Requester => self.prepare_requester_batch(next_class),
+            DataTxClass::Responder => self.prepare_read_response_batch(next_class),
+        }
+    }
+
+    fn rollback_prepared_tx(&mut self, prepared: PreparedTx) {
+        if let Some(index) = prepared.qp_index() {
+            self.synchronize_qp(index);
+        }
+    }
+
+    fn commit_prepared_tx(&mut self, prepared: PreparedTx, now: u64) -> Result<(), ApiError> {
+        match prepared {
+            PreparedTx::Control(expected) => {
+                let Some(actual) = self.pending_control.pop() else {
+                    return Err(ApiError::PacketIoContractViolation);
+                };
+                if actual != expected {
+                    return Err(ApiError::PacketIoContractViolation);
+                }
+                self.record_control_transmit(actual);
+            }
+            PreparedTx::Requester {
+                qp_index,
+                timeout_ticks,
+                next_class,
+            } => {
+                let slot = self
+                    .qps
+                    .get_mut(qp_index)
+                    .and_then(Option::as_mut)
+                    .ok_or(ApiError::InvalidQpHandle)?;
+                mark_request_packet_sent(slot, now, timeout_ticks);
+                self.next_data_tx_class = next_class;
+                self.synchronize_qp(qp_index);
+            }
+            PreparedTx::Responder {
+                qp_index,
+                next_class,
+            } => {
+                self.next_data_tx_class = next_class;
+                self.advance_read_response(qp_index)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn record_control_transmit(&mut self, reply: ControlReply) {
+        match reply.aeth.class() {
+            AethClass::Ack { .. } => {
+                self.stats.acknowledgements = self.stats.acknowledgements.saturating_add(1);
+            }
+            AethClass::RnrNak { .. } => {
+                self.stats.rnr_naks = self.stats.rnr_naks.saturating_add(1);
+            }
+            AethClass::Nak(_) | AethClass::Reserved { .. } => {
+                self.stats.negative_acknowledgements =
+                    self.stats.negative_acknowledgements.saturating_add(1);
+            }
+        }
+    }
+
     fn synchronize_qp(&mut self, index: usize) {
         let Some(slot) = self.qps.get(index).and_then(Option::as_ref) else {
             self.deschedule_qp(index);
@@ -1431,6 +1774,518 @@ where
     }
 }
 
+impl<
+    Io,
+    const QPS: usize,
+    const MRS: usize,
+    const SQ: usize,
+    const RQ: usize,
+    const CQ: usize,
+    const QPN_INDEX: usize,
+> RcEndpoint<'_, Io, QPS, MRS, SQ, RQ, CQ, QPN_INDEX>
+where
+    Io: PacketBatchIo,
+{
+    /// Make bounded batched transport progress without packet scratch buffers.
+    ///
+    /// `budget` is clamped to [`MAX_BATCH_PACKETS`]. receive frames are parsed
+    /// in place, and requester or responder state advances only for the prefix
+    /// accepted by the packet backend.
+    pub fn progress_batch(
+        &mut self,
+        now: u64,
+        budget: usize,
+    ) -> Result<RcProgress, PollError<Io::Error>> {
+        let budget = budget.min(MAX_BATCH_PACKETS);
+        if budget == 0 {
+            return Ok(RcProgress::default());
+        }
+
+        if let Err(error) = self.io.reap_tx_completions(budget) {
+            self.stats.io_errors = self.stats.io_errors.saturating_add(1);
+            return Err(PollError::Io(error));
+        }
+
+        let mut progress = RcProgress::default();
+        let timer_result = self.service_timers(now, budget);
+        progress.completions = progress
+            .completions
+            .saturating_add(timer_result.completions);
+        progress.retransmissions = progress
+            .retransmissions
+            .saturating_add(timer_result.retransmissions);
+
+        self.receive_batch_phase(now, budget, &mut progress)?;
+        self.transmit_batch_phase(now, budget, &mut progress)?;
+        Ok(progress)
+    }
+
+    fn receive_batch_phase(
+        &mut self,
+        now: u64,
+        budget: usize,
+        progress: &mut RcProgress,
+    ) -> Result<(), PollError<Io::Error>> {
+        let receive_budget = budget.min(self.pending_control.remaining_capacity());
+        if receive_budget == 0 {
+            return Ok(());
+        }
+
+        let mut frames: [Option<Io::RxFrame>; MAX_BATCH_PACKETS] = core::array::from_fn(|_| None);
+        let received = match self.io.receive_batch(&mut frames[..receive_budget]) {
+            Ok(received) => received,
+            Err(error) => {
+                self.stats.io_errors = self.stats.io_errors.saturating_add(1);
+                return Err(PollError::Io(error));
+            }
+        };
+        if received > receive_budget {
+            let _ = self.io.recycle_rx_batch(&mut frames[..receive_budget]);
+            return Err(ApiError::PacketIoContractViolation.into());
+        }
+        if frames[..received].iter().any(Option::is_none) {
+            let _ = self.io.recycle_rx_batch(&mut frames[..received]);
+            return Err(ApiError::PacketIoContractViolation.into());
+        }
+
+        let mut processing_error = None;
+        for slot in frames.iter().take(received) {
+            let frame = slot.as_ref().ok_or(ApiError::PacketIoContractViolation)?;
+            let packet = match self.io.rx_ipv4(frame) {
+                Ok(packet) => packet,
+                Err(error) => {
+                    self.stats.io_errors = self.stats.io_errors.saturating_add(1);
+                    processing_error = Some(PollError::Io(error));
+                    break;
+                }
+            };
+            if packet.len() > self.config.maximum_packet_size {
+                self.stats.invalid_packets = self.stats.invalid_packets.saturating_add(1);
+                processing_error = Some(
+                    ApiError::PacketTooLarge {
+                        length: packet.len(),
+                        maximum: self.config.maximum_packet_size,
+                    }
+                    .into(),
+                );
+                break;
+            }
+            let decoded = match decode_ipv4_packet(packet) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    self.stats.invalid_packets = self.stats.invalid_packets.saturating_add(1);
+                    processing_error = Some(PollError::Api(error));
+                    break;
+                }
+            };
+            let packet_length = packet.len();
+            self.stats.receive_packets = self.stats.receive_packets.saturating_add(1);
+            self.stats.receive_bytes = self
+                .stats
+                .receive_bytes
+                .saturating_add(u64::try_from(packet_length).unwrap_or(u64::MAX));
+
+            let state_result = process_incoming_state(
+                &self.qpn_index,
+                &mut self.qps,
+                &mut self.memory,
+                &mut self.stats,
+                self.config.ticks_per_second,
+                now,
+                decoded,
+            );
+            let (index, result) = match state_result {
+                Ok(result) => result,
+                Err(error) => {
+                    processing_error = Some(PollError::Api(error));
+                    break;
+                }
+            };
+            self.synchronize_qp(index);
+            self.stats.completions = self
+                .stats
+                .completions
+                .saturating_add(u64::try_from(result.completions).unwrap_or(u64::MAX));
+            progress.received_packets = progress.received_packets.saturating_add(1);
+            progress.completions = progress.completions.saturating_add(result.completions);
+            progress.retransmissions = progress
+                .retransmissions
+                .saturating_add(result.retransmissions);
+            if let Some(reply) = result.reply {
+                if self.pending_control.push(reply).is_err() {
+                    processing_error = Some(ApiError::PacketIoContractViolation.into());
+                    break;
+                }
+            }
+        }
+
+        if let Err(error) = self.io.recycle_rx_batch(&mut frames[..received]) {
+            self.stats.io_errors = self.stats.io_errors.saturating_add(1);
+            return Err(PollError::Io(error));
+        }
+        if let Some(error) = processing_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn transmit_batch_phase(
+        &mut self,
+        now: u64,
+        budget: usize,
+        progress: &mut RcProgress,
+    ) -> Result<(), PollError<Io::Error>> {
+        let mut batch = BatchTxBuffers::<Io::TxFrame>::default();
+        let acquired = self.acquire_batch_frames(&mut batch.frames[..budget])?;
+        if acquired == 0 {
+            return Ok(());
+        }
+
+        let (prepared_count, preparation_error) =
+            self.stage_batch_packets(acquired, &mut batch, progress);
+        if prepared_count == 0 {
+            self.release_batch_frames(&mut batch.frames[..acquired])?;
+            return match preparation_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            };
+        }
+
+        self.submit_staged_batch(
+            now,
+            acquired,
+            prepared_count,
+            &mut batch,
+            progress,
+            preparation_error,
+        )
+    }
+
+    fn acquire_batch_frames(
+        &mut self,
+        frames: &mut [Option<Io::TxFrame>],
+    ) -> Result<usize, PollError<Io::Error>> {
+        let acquired = match self.io.acquire_tx_batch(frames) {
+            Ok(acquired) => acquired,
+            Err(error) => {
+                self.stats.io_errors = self.stats.io_errors.saturating_add(1);
+                return Err(PollError::Io(error));
+            }
+        };
+        if acquired > frames.len() {
+            let _ = self.io.release_tx_batch(frames);
+            return Err(ApiError::PacketIoContractViolation.into());
+        }
+        if frames[..acquired].iter().any(Option::is_none) {
+            let _ = self.io.release_tx_batch(&mut frames[..acquired]);
+            return Err(ApiError::PacketIoContractViolation.into());
+        }
+        Ok(acquired)
+    }
+
+    fn stage_batch_packets(
+        &mut self,
+        acquired: usize,
+        batch: &mut BatchTxBuffers<Io::TxFrame>,
+        progress: &mut RcProgress,
+    ) -> (usize, Option<PollError<Io::Error>>) {
+        let mut prepared_count = 0;
+        let mut control_offset = 0;
+        let mut staging_class = self.next_data_tx_class;
+
+        for index in 0..acquired {
+            let prepared =
+                match self.prepare_next_batch_tx(&mut control_offset, &mut staging_class, progress)
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => return (prepared_count, Some(PollError::Api(error))),
+                };
+            let Some((wire, prepared_tx)) = prepared else {
+                break;
+            };
+
+            let Some(frame) = batch.frames[index].as_ref() else {
+                self.rollback_prepared_tx(prepared_tx);
+                return (
+                    prepared_count,
+                    Some(ApiError::PacketIoContractViolation.into()),
+                );
+            };
+            let length = match self.encode_batch_packet(frame, wire) {
+                Ok(length) => length,
+                Err(error) => {
+                    self.rollback_prepared_tx(prepared_tx);
+                    return (prepared_count, Some(error));
+                }
+            };
+            let Some(frame) = batch.frames[index].take() else {
+                self.rollback_prepared_tx(prepared_tx);
+                return (
+                    prepared_count,
+                    Some(ApiError::PacketIoContractViolation.into()),
+                );
+            };
+            batch.packets[index].set(frame, length);
+            batch.metadata[index] = Some(prepared_tx);
+            prepared_count += 1;
+        }
+
+        (prepared_count, None)
+    }
+
+    fn prepare_next_batch_tx(
+        &mut self,
+        control_offset: &mut usize,
+        staging_class: &mut DataTxClass,
+        progress: &mut RcProgress,
+    ) -> Result<Option<(PreparedWirePacket, PreparedTx)>, ApiError> {
+        if let Some(reply) = self.pending_control.get(*control_offset).copied() {
+            *control_offset += 1;
+            return Ok(Some((
+                prepared_control_packet(reply),
+                PreparedTx::Control(reply),
+            )));
+        }
+
+        let first_class = *staging_class;
+        let first_next = first_class.other();
+        let (first, completions) = self.prepare_data_class_batch(first_class, first_next)?;
+        progress.completions = progress.completions.saturating_add(completions);
+        if first.is_some() {
+            *staging_class = first_next;
+            return Ok(first);
+        }
+
+        let second_class = first_class.other();
+        let second_next = second_class.other();
+        let (second, completions) = self.prepare_data_class_batch(second_class, second_next)?;
+        progress.completions = progress.completions.saturating_add(completions);
+        if second.is_some() {
+            *staging_class = second_next;
+        }
+        Ok(second)
+    }
+
+    fn submit_staged_batch(
+        &mut self,
+        now: u64,
+        acquired: usize,
+        prepared_count: usize,
+        batch: &mut BatchTxBuffers<Io::TxFrame>,
+        progress: &mut RcProgress,
+        preparation_error: Option<PollError<Io::Error>>,
+    ) -> Result<(), PollError<Io::Error>> {
+        let (accepted, submission_error) = match self
+            .io
+            .submit_tx_batch(&mut batch.packets[..prepared_count])
+        {
+            Ok(accepted) => (accepted, None),
+            Err(error) => (error.submitted(), Some(error.into_error())),
+        };
+        if !Self::valid_batch_submission(&batch.packets, prepared_count, accepted) {
+            for prepared in batch
+                .metadata
+                .iter()
+                .take(prepared_count)
+                .flatten()
+                .copied()
+            {
+                self.rollback_prepared_tx(prepared);
+            }
+            for index in 0..prepared_count {
+                if batch.frames[index].is_none() {
+                    batch.frames[index] = batch.packets[index].take_frame();
+                }
+            }
+            let _ = self.io.release_tx_batch(&mut batch.frames[..acquired]);
+            return Err(ApiError::PacketIoContractViolation.into());
+        }
+
+        let commit_error = self.commit_accepted_batch(
+            now,
+            accepted,
+            &batch.packets,
+            &mut batch.metadata,
+            progress,
+        );
+        for prepared in &mut batch.metadata[accepted..prepared_count] {
+            if let Some(prepared) = prepared.take() {
+                self.rollback_prepared_tx(prepared);
+            }
+        }
+        for index in accepted..prepared_count {
+            batch.frames[index] = batch.packets[index].take_frame();
+        }
+        self.release_batch_frames(&mut batch.frames[..acquired])?;
+
+        if let Some(error) = submission_error {
+            self.stats.io_errors = self.stats.io_errors.saturating_add(1);
+            return Err(PollError::Io(error));
+        }
+        if let Some(error) = commit_error {
+            return Err(PollError::Api(error));
+        }
+        if let Some(error) = preparation_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn valid_batch_submission(
+        packets: &[TxPacket<Io::TxFrame>; MAX_BATCH_PACKETS],
+        prepared_count: usize,
+        accepted: usize,
+    ) -> bool {
+        accepted <= prepared_count
+            && packets[..accepted]
+                .iter()
+                .all(|packet| packet.frame().is_none())
+            && packets[accepted..prepared_count]
+                .iter()
+                .all(|packet| packet.frame().is_some())
+    }
+
+    fn commit_accepted_batch(
+        &mut self,
+        now: u64,
+        accepted: usize,
+        packets: &[TxPacket<Io::TxFrame>; MAX_BATCH_PACKETS],
+        metadata: &mut [Option<PreparedTx>; MAX_BATCH_PACKETS],
+        progress: &mut RcProgress,
+    ) -> Option<ApiError> {
+        let mut first_error = None;
+        for index in 0..accepted {
+            let Some(prepared) = metadata[index].take() else {
+                first_error.get_or_insert(ApiError::PacketIoContractViolation);
+                continue;
+            };
+            if let Err(error) = self.commit_prepared_tx(prepared, now) {
+                first_error.get_or_insert(error);
+            }
+            self.stats.transmit_packets = self.stats.transmit_packets.saturating_add(1);
+            self.stats.transmit_bytes = self
+                .stats
+                .transmit_bytes
+                .saturating_add(u64::try_from(packets[index].len()).unwrap_or(u64::MAX));
+            progress.transmitted_packets = progress.transmitted_packets.saturating_add(1);
+        }
+        first_error
+    }
+
+    fn release_batch_frames(
+        &mut self,
+        frames: &mut [Option<Io::TxFrame>],
+    ) -> Result<(), PollError<Io::Error>> {
+        if let Err(error) = self.io.release_tx_batch(frames) {
+            self.stats.io_errors = self.stats.io_errors.saturating_add(1);
+            return Err(PollError::Io(error));
+        }
+        Ok(())
+    }
+
+    fn encode_batch_packet(
+        &mut self,
+        frame: &Io::TxFrame,
+        prepared: PreparedWirePacket,
+    ) -> Result<usize, PollError<Io::Error>> {
+        let maximum_packet_size = self.config.maximum_packet_size;
+        let payload = &self.payload_scratch[..prepared.payload_length];
+        let output = match self.io.tx_ipv4_buffer(frame) {
+            Ok(output) => output,
+            Err(error) => {
+                self.stats.io_errors = self.stats.io_errors.saturating_add(1);
+                return Err(PollError::Io(error));
+            }
+        };
+        let length = encode_ipv4_packet(
+            prepared.path,
+            PacketSpec {
+                bth: prepared.bth,
+                reth: prepared.reth,
+                aeth: prepared.aeth,
+                immediate_data: None,
+                payload,
+            },
+            output,
+        )?;
+        if length > maximum_packet_size {
+            return Err(ApiError::PacketTooLarge {
+                length,
+                maximum: maximum_packet_size,
+            }
+            .into());
+        }
+        Ok(length)
+    }
+}
+
+fn prepared_control_packet(reply: ControlReply) -> PreparedWirePacket {
+    PreparedWirePacket {
+        path: reply.path,
+        bth: Bth::new(
+            Opcode::Acknowledge,
+            reply.destination_qpn,
+            reply.psn.value(),
+        ),
+        reth: None,
+        aeth: Some(reply.aeth),
+        payload_length: 0,
+    }
+}
+
+fn process_incoming_state<
+    const QPS: usize,
+    const MRS: usize,
+    const SQ: usize,
+    const RQ: usize,
+    const CQ: usize,
+    const QPN_INDEX: usize,
+>(
+    qpn_index: &QpnTable<QPN_INDEX>,
+    qps: &mut [Option<Box<RcQpSlot<SQ, RQ, CQ>>>; QPS],
+    memory: &mut MemoryRegistry<'_, MRS>,
+    stats: &mut RcEndpointStats,
+    ticks_per_second: u64,
+    now: u64,
+    decoded: DecodedPacket<'_>,
+) -> Result<(usize, HandlerResult), ApiError> {
+    let destination_qpn = decoded.transport.bth.destination_qpn;
+    let Some(index) = qpn_slot(qpn_index, destination_qpn) else {
+        stats.unknown_qp_packets = stats.unknown_qp_packets.saturating_add(1);
+        return Err(ApiError::UnknownDestinationQpn(destination_qpn));
+    };
+
+    let slot = qps
+        .get_mut(index)
+        .and_then(Option::as_mut)
+        .ok_or(ApiError::InvalidQpHandle)?;
+    if decoded.ipv4.source != slot.path.destination || decoded.ipv4.destination != slot.path.source
+    {
+        stats.peer_mismatch_packets = stats.peer_mismatch_packets.saturating_add(1);
+        return Err(ApiError::PeerAddressMismatch {
+            source: decoded.ipv4.source,
+            destination: decoded.ipv4.destination,
+        });
+    }
+    if !slot.machine.can_receive() {
+        return Err(ApiError::QpNotReady(slot.machine.state()));
+    }
+
+    let result = if decoded.transport.bth.opcode.is_request() {
+        handle_request_packet(slot, memory, decoded.transport, stats)
+    } else {
+        handle_response_packet(
+            slot,
+            memory,
+            decoded.transport,
+            now,
+            ticks_per_second,
+            stats,
+        )
+    };
+    Ok((index, result))
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct EmitResult {
     transmitted: bool,
@@ -1453,6 +2308,39 @@ fn maximum_packet_for_mtu(mtu: usize) -> Result<usize, ApiError> {
         .and_then(|value| value.checked_add(3))
         .and_then(|value| value.checked_add(ICRC_LEN))
         .ok_or(ApiError::ArithmeticOverflow)
+}
+
+fn validate_posted_work<const MRS: usize>(
+    memory: &MemoryRegistry<'_, MRS>,
+    work: WorkRequest,
+    mtu: usize,
+) -> Result<(), ApiError> {
+    let packets = packet_count(work.sge.length, mtu);
+    if packets > MAX_OUTSTANDING_PACKETS {
+        return Err(ApiError::WorkRequestTooLarge {
+            packets,
+            maximum: MAX_OUTSTANDING_PACKETS,
+        });
+    }
+    let length = usize::try_from(work.sge.length).map_err(|_| ApiError::ArithmeticOverflow)?;
+    match work.kind {
+        WorkRequestKind::Send => {
+            memory.validate_local_read(work.sge.lkey, work.sge.address, length)?;
+        }
+        WorkRequestKind::RdmaWrite { remote_address, .. } => {
+            memory.validate_local_read(work.sge.lkey, work.sge.address, length)?;
+            remote_address
+                .checked_add(u64::from(work.sge.length))
+                .ok_or(ApiError::ArithmeticOverflow)?;
+        }
+        WorkRequestKind::RdmaRead { remote_address, .. } => {
+            memory.validate_local_write(work.sge.lkey, work.sge.address, length)?;
+            remote_address
+                .checked_add(u64::from(work.sge.length))
+                .ok_or(ApiError::ArithmeticOverflow)?;
+        }
+    }
+    Ok(())
 }
 
 fn packet_count(length: u32, mtu: usize) -> u32 {
