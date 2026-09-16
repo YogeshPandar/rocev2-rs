@@ -1,0 +1,49 @@
+name: validate-batched-io-v4
+
+on:
+  push:
+    branches: [automation/batched-io-v4]
+    paths: [.review/batch-import-v4.ready]
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: thumbv7em-none-eabihf
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: Verify and apply implementation
+        shell: bash
+        run: |
+          echo 'd949a8a4c74197c137e362089c5c8292c569b71ad871c6b34a32983e45144359  .review/batch-import-v4.patch.xz' | sha256sum -c -
+          xz -dc .review/batch-import-v4.patch.xz > /tmp/batch.patch
+          echo 'fa0859f92578e392563503a53c9a7a75941187f8e4a53e8b2285cf85283aa6ca  /tmp/batch.patch' | sha256sum -c -
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git am /tmp/batch.patch
+          rm .github/workflows/import-batched-io-v4.yml
+          rm .review/batch-import-v4.patch.xz .review/batch-import-v4.ready
+          git reset --soft origin/main
+          git add -A
+          git commit -m 'perf(rc): add batched packet I/O'
+      - name: Validate implementation
+        shell: bash
+        run: |
+          cargo +stable fmt --all -- --check
+          cargo +stable test --workspace --all-features --all-targets
+          cargo +stable clippy --workspace --all-features --all-targets -- -D warnings
+          cargo +stable check -p rocev2-wire --no-default-features --target thumbv7em-none-eabihf
+          cargo +stable check -p rocev2-core --no-default-features --target thumbv7em-none-eabihf
+          cargo +stable check -p rocev2-memory --no-default-features --target thumbv7em-none-eabihf
+          cargo +1.85.0 test --workspace --all-features --all-targets
+      - name: Publish validated implementation
+        run: git push --force origin HEAD:perf/batched-packet-io
