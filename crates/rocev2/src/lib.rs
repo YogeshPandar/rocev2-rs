@@ -29,7 +29,9 @@ pub use packet::{
     DecodedPacket, Ipv4Path, MIN_ROCE_IPV4_PACKET, decode_ipv4_packet, encode_ipv4_packet,
 };
 pub use qp::QpHandle;
-pub use rc::{RcEndpoint, RcEndpointConfig, RcEndpointStats, RcProgress, RcQpConfig};
+pub use rc::{
+    MAX_BATCH_PACKETS, RcEndpoint, RcEndpointConfig, RcEndpointStats, RcProgress, RcQpConfig,
+};
 
 pub use rocev2_core as core;
 pub use rocev2_io as io;

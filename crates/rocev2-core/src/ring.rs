@@ -66,6 +66,21 @@ impl<T, const N: usize> Ring<T, N> {
         self.len == N
     }
 
+    /// Return the number of additional elements that can be queued.
+    #[must_use]
+    pub const fn remaining_capacity(&self) -> usize {
+        N - self.len
+    }
+
+    /// Borrow the element at `offset` relative to the current head.
+    #[must_use]
+    pub fn get(&self, offset: usize) -> Option<&T> {
+        if offset >= self.len || N == 0 {
+            return None;
+        }
+        self.slots[(self.head + offset) % N].as_ref()
+    }
+
     /// Insert an item at the producer end.
     pub fn push(&mut self, item: T) -> Result<(), PushError<T>> {
         if self.is_full() {
@@ -142,6 +157,21 @@ mod tests {
         assert_eq!(ring.pop(), Some(3));
         assert_eq!(ring.pop(), Some(4));
         assert_eq!(ring.pop(), None);
+    }
+
+    #[test]
+    fn get_indexes_from_head_across_wrap() {
+        let mut ring = Ring::<u32, 3>::new();
+        ring.push(1).unwrap();
+        ring.push(2).unwrap();
+        assert_eq!(ring.pop(), Some(1));
+        ring.push(3).unwrap();
+        ring.push(4).unwrap();
+        assert_eq!(ring.get(0), Some(&2));
+        assert_eq!(ring.get(1), Some(&3));
+        assert_eq!(ring.get(2), Some(&4));
+        assert_eq!(ring.get(3), None);
+        assert_eq!(ring.remaining_capacity(), 0);
     }
 
     #[test]
