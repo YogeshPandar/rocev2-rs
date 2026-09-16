@@ -1,0 +1,17 @@
+[package]
+name = "rocev2-wire"
+description = "Dependency-free no_std RoCEv2 wire-format parser, encoder, and ICRC implementation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+
+[lints]
+workspace = true

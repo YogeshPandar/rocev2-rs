@@ -1,0 +1,26 @@
+[package]
+name = "rocev2"
+description = "Pure-Rust userspace RoCEv2 Reliable Connected transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["raw-ipv4"]
+raw-ipv4 = ["rocev2-io/raw-ipv4"]
+afxdp = ["rocev2-io/afxdp"]
+
+[dependencies]
+rocev2-core = { path = "../rocev2-core", version = "0.1.0" }
+rocev2-io = { path = "../rocev2-io", version = "0.1.0", default-features = false }
+rocev2-memory = { path = "../rocev2-memory", version = "0.1.0" }
+rocev2-wire = { path = "../rocev2-wire", version = "0.1.0" }
+
+[lints]
+workspace = true

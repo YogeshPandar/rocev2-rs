@@ -1,0 +1,36 @@
+[package]
+name = "rocev2-io"
+description = "Packet I/O backends for rocev2-rs, including Linux raw IPv4 reference I/O"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["raw-ipv4"]
+raw-ipv4 = ["dep:libc"]
+afxdp = ["dep:libc"]
+
+[dependencies]
+libc = { version = "0.2", optional = true }
+rocev2-wire = { path = "../rocev2-wire", version = "0.1.0" }
+
+[lints.rust]
+unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
