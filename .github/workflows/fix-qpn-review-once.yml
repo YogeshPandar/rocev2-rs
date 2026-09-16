@@ -25,25 +25,19 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
+          import re
 
           path = Path("crates/rocev2/src/endpoint.rs")
           text = path.read_text()
-          old = '''    pub fn reconfigure_qp(&mut self, handle: QpHandle, config: QpConfig) -> Result<(), ApiError> {
-              if self.qps.iter().flatten().any(|slot| {
-                  slot.machine.config().local_qpn == config.local_qpn
-                      && slot.generation != handle.generation()
-              }) {
-                  return Err(ApiError::DuplicateLocalQpn(config.local_qpn));
-              }
-
-              let slot = self.qp_slot_mut(handle)?;
-              slot.machine.reconfigure(config)?;
-              slot.send_window.reset(config.send_psn);
-              slot.receive_psn.reset(config.receive_psn);
-              Ok(())
-          }
-          '''
-          new = '''    pub fn reconfigure_qp(&mut self, handle: QpHandle, config: QpConfig) -> Result<(), ApiError> {
+          method_pattern = re.compile(
+              r"    pub fn reconfigure_qp\([\s\S]*?\n    }\n\n"
+              r"    /// Reserve the next requester PSN",
+          )
+          method = '''    pub fn reconfigure_qp(
+              &mut self,
+              handle: QpHandle,
+              config: QpConfig,
+          ) -> Result<(), ApiError> {
               let handle_index = self.qp_index(handle)?;
               if self
                   .qps
@@ -64,10 +58,11 @@ jobs:
               slot.receive_psn.reset(config.receive_psn);
               Ok(())
           }
-          '''
-          if old not in text:
-              raise SystemExit("expected reconfigure_qp implementation not found")
-          text = text.replace(old, new, 1)
+
+              /// Reserve the next requester PSN'''
+          text, substitutions = method_pattern.subn(method, text, count=1)
+          if substitutions != 1:
+              raise SystemExit(f"expected one reconfigure_qp method, replaced {substitutions}")
 
           anchor = '''    #[test]
           fn rejects_duplicate_local_qpn() {
