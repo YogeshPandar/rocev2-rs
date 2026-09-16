@@ -222,9 +222,9 @@ mod tests {
 
     #[test]
     fn rejects_zero_capacity() {
-        assert_eq!(
+        assert!(matches!(
             Segmenter::new(TransferKind::Send, &[1], 0),
             Err(SegmentError::ZeroPayloadCapacity)
-        );
+        ));
     }
 }
