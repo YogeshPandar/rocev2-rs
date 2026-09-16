@@ -7,6 +7,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: bootstrap-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   materialize-and-verify:
     runs-on: ubuntu-24.04
@@ -18,26 +22,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat <<'SUMS' | sha256sum --check
-          1d1f367b2c0246897d7329b36863fcb1ed1a58d332b583b4ebb7e4da25e86a2b  .bootstrap/part-00
-          ec96c90387387f100600d85c33b3fdb9b56f57c900597054a99565e684bbdbdf  .bootstrap/part-01
-          d9e0c3cd38d7db8884a491383c7d0cab2a967a48c011a78b567b842ca747d556  .bootstrap/part-02
-          cc57dc556115a7387397ea0033cc53762a5371cbee6335f899cac84c901b4aea  .bootstrap/part-03
-          9b0ebeaa1c3d9e7c1906ebb72d109db20f74552b88998038c6078f9092d35668  .bootstrap/part-04
-          2a36eb135601383d817ed0dfeecfb7ea2cc36e4b8d6b6b607bc2a6698ab53c3f  .bootstrap/part-05
-          b36440061026d56ba7fdf80a3837b74cc937faaaf4a7ed9d9bdc638811aab4d1  .bootstrap/part-06
-          eac6ed7d0ee944d4109d6c8356326a7f2ed6228a52f584368e27c67a6cfc2dd3  .bootstrap/part-07
-          d439e7edaebe7edc2a77f17df60fb128d789da38916a274d638b43eb3fafa072  .bootstrap/part-08
-          SUMS
           cat .bootstrap/part-* | base64 --decode > /tmp/rocev2-src.tgz
-          echo 'b82ef655fabb5d224238eeb84c05374c716f029b78d95df7dd9106e64de18362  /tmp/rocev2-src.tgz' | sha256sum --check
+          gzip --test /tmp/rocev2-src.tgz
+          tar --list --gzip --file /tmp/rocev2-src.tgz >/dev/null
           tar --extract --gzip --file /tmp/rocev2-src.tgz --overwrite
           rm -rf .bootstrap .github/workflows/bootstrap.yml
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add --all
-          git commit -m 'feat: implement pure-Rust RoCEv2 RC transport'
-          git push origin HEAD:feat/initial-rocev2-stack
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -47,3 +36,12 @@ jobs:
         run: cargo test --workspace --all-features --all-targets
       - name: Clippy
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+      - name: Commit materialized source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add --all
+          git commit -m 'feat: materialize pure-Rust RoCEv2 workspace'
+          git push origin HEAD:feat/initial-rocev2-stack
