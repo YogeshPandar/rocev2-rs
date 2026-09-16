@@ -2,9 +2,11 @@
 
 use rocev2::io::{Frame, MockIo};
 use rocev2::memory::AccessFlags;
+use rocev2::wire::{Aeth, AethClass, Bth, Opcode, PacketSpec};
 use rocev2::{
     Completion, CompletionOpcode, CompletionStatus, Ipv4Path, PathMtu, Psn, QpConfig, QpHandle,
     QpState, RcEndpoint, RcEndpointConfig, RcQpConfig, RecvWorkRequest, Sge, WorkRequest,
+    decode_ipv4_packet, encode_ipv4_packet,
 };
 
 type TestEndpoint<'a> = RcEndpoint<'a, MockIo, 2, 8, 8, 8, 16>;
@@ -51,6 +53,32 @@ fn ready(endpoint: &mut TestEndpoint<'_>, handle: QpHandle) {
     endpoint.transition_qp(handle, QpState::Rts).unwrap();
 }
 
+fn read_replay_qps(requester: &mut TestEndpoint<'_>, responder: &mut TestEndpoint<'_>) -> QpHandle {
+    let requester_qp = requester
+        .create_qp(qp_config(
+            2,
+            3,
+            100,
+            200,
+            [203, 0, 113, 10],
+            [203, 0, 113, 11],
+        ))
+        .unwrap();
+    let responder_qp = responder
+        .create_qp(qp_config(
+            3,
+            2,
+            200,
+            100,
+            [203, 0, 113, 11],
+            [203, 0, 113, 10],
+        ))
+        .unwrap();
+    ready(requester, requester_qp);
+    ready(responder, responder_qp);
+    requester_qp
+}
+
 fn move_packets(source: &mut TestEndpoint<'_>, destination: &mut TestEndpoint<'_>) -> usize {
     let mut moved = 0;
     while let Some(frame) = source.io_mut().pop_transmitted() {
@@ -61,6 +89,134 @@ fn move_packets(source: &mut TestEndpoint<'_>, destination: &mut TestEndpoint<'_
         moved += 1;
     }
     moved
+}
+
+fn inject_ack(endpoint: &mut TestEndpoint<'_>, path: Ipv4Path, destination_qpn: u32, psn: u32) {
+    let mut packet = [0_u8; 512];
+    let length = encode_ipv4_packet(
+        path,
+        PacketSpec {
+            bth: Bth::new(Opcode::Acknowledge, destination_qpn, psn),
+            reth: None,
+            aeth: Some(Aeth::ack(0)),
+            immediate_data: None,
+            payload: &[],
+        },
+        &mut packet,
+    )
+    .unwrap();
+    endpoint.io_mut().inject_receive(&packet[..length]).unwrap();
+}
+
+fn packet_identity(frame: &Frame) -> (Opcode, u32) {
+    let decoded = decode_ipv4_packet(frame.as_bytes()).unwrap();
+    (decoded.transport.bth.opcode, decoded.transport.bth.psn)
+}
+
+fn complete_two_packet_read(
+    requester: &mut TestEndpoint<'_>,
+    responder: &mut TestEndpoint<'_>,
+    requester_qp: QpHandle,
+    work: WorkRequest,
+    request_psn: u32,
+    now: u64,
+) -> Frame {
+    let mut requester_rx = [0_u8; 512];
+    let mut requester_tx = [0_u8; 512];
+    let mut responder_rx = [0_u8; 512];
+    let mut responder_tx = [0_u8; 512];
+
+    requester.post_work(requester_qp, work).unwrap();
+    requester
+        .progress(now, &mut requester_rx, &mut requester_tx)
+        .unwrap();
+    let request = requester.io_mut().pop_transmitted().unwrap();
+    assert_eq!(
+        packet_identity(&request),
+        (Opcode::RdmaReadRequest, request_psn),
+    );
+    responder
+        .io_mut()
+        .inject_receive(request.as_bytes())
+        .unwrap();
+    responder
+        .progress(now, &mut responder_rx, &mut responder_tx)
+        .unwrap();
+
+    for (offset, opcode) in [Opcode::RdmaReadResponseFirst, Opcode::RdmaReadResponseLast]
+        .into_iter()
+        .enumerate()
+    {
+        let response = responder.io_mut().pop_transmitted().unwrap();
+        assert_eq!(
+            packet_identity(&response),
+            (opcode, request_psn + offset as u32),
+        );
+        requester
+            .io_mut()
+            .inject_receive(response.as_bytes())
+            .unwrap();
+        requester
+            .progress(now + offset as u64, &mut requester_rx, &mut requester_tx)
+            .unwrap();
+        if offset == 0 {
+            responder
+                .progress(now + 1, &mut responder_rx, &mut responder_tx)
+                .unwrap();
+        }
+    }
+
+    assert!(
+        requester
+            .poll_completion(requester_qp)
+            .unwrap()
+            .is_some_and(Completion::is_success)
+    );
+    request
+}
+
+fn begin_two_packet_read(
+    requester: &mut TestEndpoint<'_>,
+    responder: &mut TestEndpoint<'_>,
+    requester_qp: QpHandle,
+    work: WorkRequest,
+    request_psn: u32,
+    now: u64,
+) -> Frame {
+    let mut requester_rx = [0_u8; 512];
+    let mut requester_tx = [0_u8; 512];
+    let mut responder_rx = [0_u8; 512];
+    let mut responder_tx = [0_u8; 512];
+
+    requester.post_work(requester_qp, work).unwrap();
+    requester
+        .progress(now, &mut requester_rx, &mut requester_tx)
+        .unwrap();
+    let request = requester.io_mut().pop_transmitted().unwrap();
+    assert_eq!(
+        packet_identity(&request),
+        (Opcode::RdmaReadRequest, request_psn),
+    );
+    responder
+        .io_mut()
+        .inject_receive(request.as_bytes())
+        .unwrap();
+    responder
+        .progress(now, &mut responder_rx, &mut responder_tx)
+        .unwrap();
+    let first_response = responder.io_mut().pop_transmitted().unwrap();
+    assert_eq!(
+        packet_identity(&first_response),
+        (Opcode::RdmaReadResponseFirst, request_psn),
+    );
+    requester
+        .io_mut()
+        .inject_receive(first_response.as_bytes())
+        .unwrap();
+    requester
+        .progress(now, &mut requester_rx, &mut requester_tx)
+        .unwrap();
+    request
 }
 
 fn pump(
@@ -379,4 +535,191 @@ fn invalid_remote_key_completes_with_remote_access_error() {
         ))
     );
     assert_eq!(requester.qp_state(requester_qp), Ok(QpState::Error));
+}
+
+#[test]
+fn rejects_ack_for_reserved_but_unsent_psn() {
+    let mut source = [0x6a_u8; 300];
+    let mut requester = endpoint();
+    let source_mr = requester
+        .register_memory(&mut source, AccessFlags::NONE)
+        .unwrap();
+    let requester_qp = requester
+        .create_qp(qp_config(2, 3, 10, 40, [192, 0, 2, 10], [192, 0, 2, 11]))
+        .unwrap();
+    ready(&mut requester, requester_qp);
+    requester
+        .post_work(
+            requester_qp,
+            WorkRequest::send(
+                7,
+                Sge::new(source_mr.address(), 300, source_mr.lkey()),
+                true,
+            ),
+        )
+        .unwrap();
+
+    let mut rx = [0_u8; 512];
+    let mut tx = [0_u8; 512];
+    requester.progress(0, &mut rx, &mut tx).unwrap();
+    let first = requester.io_mut().pop_transmitted().unwrap();
+    assert_eq!(packet_identity(&first), (Opcode::SendFirst, 10));
+
+    inject_ack(
+        &mut requester,
+        Ipv4Path::new([192, 0, 2, 11], [192, 0, 2, 10], 49_153),
+        2,
+        11,
+    );
+    requester.progress(1, &mut rx, &mut tx).unwrap();
+
+    assert_eq!(
+        requester.poll_completion(requester_qp).unwrap(),
+        Some(Completion::failure(
+            7,
+            CompletionOpcode::Send,
+            CompletionStatus::TransportError,
+        ))
+    );
+    assert_eq!(requester.qp_state(requester_qp), Ok(QpState::Error));
+}
+
+#[test]
+fn delayed_ack_after_timeout_can_cover_packets_sent_before_retry() {
+    let mut source = [0x7b_u8; 300];
+    let mut requester = endpoint();
+    let source_mr = requester
+        .register_memory(&mut source, AccessFlags::NONE)
+        .unwrap();
+    let requester_qp = requester
+        .create_qp(qp_config(
+            2,
+            3,
+            20,
+            70,
+            [198, 51, 100, 10],
+            [198, 51, 100, 11],
+        ))
+        .unwrap();
+    ready(&mut requester, requester_qp);
+    requester
+        .post_work(
+            requester_qp,
+            WorkRequest::send(
+                8,
+                Sge::new(source_mr.address(), 300, source_mr.lkey()),
+                true,
+            ),
+        )
+        .unwrap();
+
+    let mut rx = [0_u8; 512];
+    let mut tx = [0_u8; 512];
+    requester.progress(0, &mut rx, &mut tx).unwrap();
+    assert_eq!(
+        packet_identity(&requester.io_mut().pop_transmitted().unwrap()),
+        (Opcode::SendFirst, 20),
+    );
+    requester.progress(1, &mut rx, &mut tx).unwrap();
+    assert_eq!(
+        packet_identity(&requester.io_mut().pop_transmitted().unwrap()),
+        (Opcode::SendLast, 21),
+    );
+
+    inject_ack(
+        &mut requester,
+        Ipv4Path::new([198, 51, 100, 11], [198, 51, 100, 10], 49_153),
+        2,
+        21,
+    );
+    requester.progress(6, &mut rx, &mut tx).unwrap();
+
+    assert_eq!(
+        requester.poll_completion(requester_qp).unwrap(),
+        Some(Completion::success(8, CompletionOpcode::Send, 300))
+    );
+    assert_eq!(requester.qp_state(requester_qp), Ok(QpState::Rts));
+    assert_eq!(requester.stats().retransmissions, 1);
+}
+
+#[test]
+fn stale_duplicate_read_does_not_replace_active_response() {
+    let mut local = [0_u8; 300];
+    let mut remote = [0x4c_u8; 300];
+    let mut requester = endpoint();
+    let mut responder = endpoint();
+    let local_mr = requester
+        .register_memory(&mut local, AccessFlags::LOCAL_WRITE)
+        .unwrap();
+    let remote_mr = responder
+        .register_memory(&mut remote, AccessFlags::REMOTE_READ)
+        .unwrap();
+    let requester_qp = read_replay_qps(&mut requester, &mut responder);
+
+    let read = |id| {
+        WorkRequest::read(
+            id,
+            Sge::new(local_mr.address(), 300, local_mr.lkey()),
+            remote_mr.address(),
+            remote_mr.rkey(),
+            true,
+        )
+    };
+    let old_request = complete_two_packet_read(
+        &mut requester,
+        &mut responder,
+        requester_qp,
+        read(1),
+        100,
+        0,
+    );
+    begin_two_packet_read(
+        &mut requester,
+        &mut responder,
+        requester_qp,
+        read(2),
+        102,
+        10,
+    );
+
+    let mut requester_rx = [0_u8; 512];
+    let mut requester_tx = [0_u8; 512];
+    let mut responder_rx = [0_u8; 512];
+    let mut responder_tx = [0_u8; 512];
+    responder
+        .io_mut()
+        .inject_receive(old_request.as_bytes())
+        .unwrap();
+    responder
+        .progress(11, &mut responder_rx, &mut responder_tx)
+        .unwrap();
+    let stale_reply = responder.io_mut().pop_transmitted().unwrap();
+    let decoded = decode_ipv4_packet(stale_reply.as_bytes()).unwrap();
+    assert_eq!(decoded.transport.bth.opcode, Opcode::Acknowledge);
+    assert!(matches!(
+        decoded.transport.aeth.map(Aeth::class),
+        Some(AethClass::RnrNak { .. })
+    ));
+
+    responder
+        .progress(12, &mut responder_rx, &mut responder_tx)
+        .unwrap();
+    let current_last = responder.io_mut().pop_transmitted().unwrap();
+    assert_eq!(
+        packet_identity(&current_last),
+        (Opcode::RdmaReadResponseLast, 103),
+    );
+    requester
+        .io_mut()
+        .inject_receive(current_last.as_bytes())
+        .unwrap();
+    requester
+        .progress(12, &mut requester_rx, &mut requester_tx)
+        .unwrap();
+
+    assert_eq!(
+        requester.poll_completion(requester_qp).unwrap(),
+        Some(Completion::success(2, CompletionOpcode::RdmaRead, 300))
+    );
+    assert_eq!(requester.stats().retransmissions, 0);
 }

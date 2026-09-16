@@ -154,6 +154,7 @@ struct ActiveRequest {
     last_psn: Psn,
     packet_count: u32,
     next_packet: u32,
+    transmitted_packets: u32,
     read_packets_received: u32,
     bytes_received: u32,
     retry_budget: RetryBudget,
@@ -218,6 +219,7 @@ struct RcQpSlot<const SQ: usize, const RQ: usize, const CQ: usize> {
     active_request: Option<ActiveRequest>,
     inbound_message: Option<InboundMessage>,
     read_response: Option<ReadResponseState>,
+    read_replay: Option<ReadResponseState>,
     message_sequence_number: Psn,
 }
 
@@ -237,6 +239,7 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
             active_request: None,
             inbound_message: None,
             read_response: None,
+            read_replay: None,
             message_sequence_number: Psn::ZERO,
         })
     }
@@ -317,6 +320,7 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
             self.inbound_message = None;
         }
         self.read_response = None;
+        self.read_replay = None;
 
         while let Some(work) = self.send_queue.pop() {
             let opcode = match work.kind {
@@ -362,6 +366,7 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
         self.active_request = None;
         self.inbound_message = None;
         self.read_response = None;
+        self.read_replay = None;
     }
 }
 
@@ -1261,6 +1266,7 @@ fn start_next_request<const SQ: usize, const RQ: usize, const CQ: usize>(
         last_psn: first_psn.wrapping_add(count - 1),
         packet_count: count,
         next_packet: 0,
+        transmitted_packets: 0,
         read_packets_received: 0,
         bytes_received: 0,
         retry_budget: RetryBudget::new(policy),
@@ -1420,11 +1426,13 @@ fn mark_request_packet_sent<const SQ: usize, const RQ: usize, const CQ: usize>(
     };
     match current.work.kind {
         WorkRequestKind::RdmaRead { .. } => {
+            current.transmitted_packets = current.transmitted_packets.max(1);
             current.phase = RequestPhase::Waiting;
             current.timer.arm(now, timeout_ticks);
         }
         WorkRequestKind::Send | WorkRequestKind::RdmaWrite { .. } => {
             current.next_packet += 1;
+            current.transmitted_packets = current.transmitted_packets.max(current.next_packet);
             if current.next_packet == current.packet_count {
                 current.phase = RequestPhase::Waiting;
                 current.timer.arm(now, timeout_ticks);
@@ -1455,28 +1463,7 @@ fn handle_request_packet<const MRS: usize, const SQ: usize, const RQ: usize, con
         ReceiveDisposition::Duplicate => {
             stats.duplicate_requests = stats.duplicate_requests.saturating_add(1);
             if matches!(packet.bth.opcode, Opcode::RdmaReadRequest) {
-                if let Some(reth) = packet.reth {
-                    let packets =
-                        packet_count(reth.dma_length, slot.machine.config().path_mtu.bytes());
-                    if memory
-                        .validate_remote_read(
-                            reth.remote_key,
-                            reth.virtual_address,
-                            usize::try_from(reth.dma_length).unwrap_or(usize::MAX),
-                        )
-                        .is_ok()
-                    {
-                        slot.read_response = Some(ReadResponseState {
-                            request_psn: received_psn,
-                            address: reth.virtual_address,
-                            rkey: reth.remote_key,
-                            length: reth.dma_length,
-                            packet_count: packets,
-                            next_packet: 0,
-                        });
-                        return HandlerResult::default();
-                    }
-                }
+                return replay_read_request(slot, memory, packet, received_psn);
             }
             return HandlerResult {
                 reply: Some(ack_reply(slot, received_psn)),
@@ -1509,6 +1496,53 @@ fn handle_request_packet<const MRS: usize, const SQ: usize, const RQ: usize, con
         | Opcode::RdmaReadResponseOnly
         | Opcode::Acknowledge => fatal_request_error(slot, received_psn, Aeth::NAK_INVALID_REQUEST),
     }
+}
+
+fn replay_read_request<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
+    slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &MemoryRegistry<'_, MRS>,
+    packet: PacketRef<'_>,
+    psn: Psn,
+) -> HandlerResult {
+    let Some(reth) = packet.reth else {
+        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+    };
+    let replay = ReadResponseState {
+        request_psn: psn,
+        address: reth.virtual_address,
+        rkey: reth.remote_key,
+        length: reth.dma_length,
+        packet_count: packet_count(reth.dma_length, slot.machine.config().path_mtu.bytes()),
+        next_packet: 0,
+    };
+    if memory
+        .validate_remote_read(
+            reth.remote_key,
+            reth.virtual_address,
+            usize::try_from(reth.dma_length).unwrap_or(usize::MAX),
+        )
+        .is_err()
+    {
+        return fatal_request_error(slot, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
+    }
+
+    if slot.read_replay != Some(replay)
+        || slot
+            .read_response
+            .is_some_and(|active| active.request_psn != psn)
+    {
+        return HandlerResult {
+            reply: Some(control_reply(
+                slot,
+                psn,
+                Aeth::rnr_nak(slot.message_sequence_number.value(), slot.rnr_nak_timer),
+            )),
+            ..HandlerResult::default()
+        };
+    }
+
+    slot.read_response = Some(replay);
+    HandlerResult::default()
 }
 
 fn handle_send_request<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
@@ -1816,14 +1850,16 @@ fn handle_read_request<const MRS: usize, const SQ: usize, const RQ: usize, const
     let packets = packet_count(reth.dma_length, slot.machine.config().path_mtu.bytes());
     slot.receive_psn.observe_span(psn, packets);
     slot.message_sequence_number = slot.message_sequence_number.next();
-    slot.read_response = Some(ReadResponseState {
+    let response = ReadResponseState {
         request_psn: psn,
         address: reth.virtual_address,
         rkey: reth.remote_key,
         length: reth.dma_length,
         packet_count: packets,
         next_packet: 0,
-    });
+    };
+    slot.read_replay = Some(response);
+    slot.read_response = Some(response);
     HandlerResult::default()
 }
 
@@ -1929,6 +1965,18 @@ fn handle_aeth_response<const SQ: usize, const RQ: usize, const CQ: usize>(
                 return HandlerResult::default();
             };
             if matches!(active.work.kind, WorkRequestKind::RdmaRead { .. }) {
+                return fail_active_transport(slot);
+            }
+            if active.transmitted_packets == 0
+                || matches!(
+                    response_psn.compare(
+                        active
+                            .first_psn
+                            .wrapping_add(active.transmitted_packets - 1),
+                    ),
+                    rocev2_core::PsnOrdering::After
+                )
+            {
                 return fail_active_transport(slot);
             }
             match slot.send_window.acknowledge(response_psn) {
