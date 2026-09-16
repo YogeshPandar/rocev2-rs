@@ -1,0 +1,108 @@
+name: fix-qpn-review-once
+
+on:
+  push:
+    branches: [feat/initial-rocev2-stack]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: qpn-review-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patch-test-and-commit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Fix exact-slot duplicate-QPN validation
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("crates/rocev2/src/endpoint.rs")
+          text = path.read_text()
+          old = '''    pub fn reconfigure_qp(&mut self, handle: QpHandle, config: QpConfig) -> Result<(), ApiError> {
+              if self.qps.iter().flatten().any(|slot| {
+                  slot.machine.config().local_qpn == config.local_qpn
+                      && slot.generation != handle.generation()
+              }) {
+                  return Err(ApiError::DuplicateLocalQpn(config.local_qpn));
+              }
+
+              let slot = self.qp_slot_mut(handle)?;
+              slot.machine.reconfigure(config)?;
+              slot.send_window.reset(config.send_psn);
+              slot.receive_psn.reset(config.receive_psn);
+              Ok(())
+          }
+          '''
+          new = '''    pub fn reconfigure_qp(&mut self, handle: QpHandle, config: QpConfig) -> Result<(), ApiError> {
+              let handle_index = self.qp_index(handle)?;
+              if self
+                  .qps
+                  .iter()
+                  .enumerate()
+                  .filter(|(index, _)| *index != handle_index)
+                  .filter_map(|(_, slot)| slot.as_ref())
+                  .any(|slot| slot.machine.config().local_qpn == config.local_qpn)
+              {
+                  return Err(ApiError::DuplicateLocalQpn(config.local_qpn));
+              }
+
+              let slot = self.qps[handle_index]
+                  .as_mut()
+                  .ok_or(ApiError::InvalidQpHandle)?;
+              slot.machine.reconfigure(config)?;
+              slot.send_window.reset(config.send_psn);
+              slot.receive_psn.reset(config.receive_psn);
+              Ok(())
+          }
+          '''
+          if old not in text:
+              raise SystemExit("expected reconfigure_qp implementation not found")
+          text = text.replace(old, new, 1)
+
+          anchor = '''    #[test]
+          fn rejects_duplicate_local_qpn() {
+          '''
+          regression = '''    #[test]
+          fn reconfigure_rejects_qpn_owned_by_another_same_generation_slot() {
+              let mut endpoint = endpoint();
+              let first = endpoint.create_qp(qp_config(2)).unwrap();
+              let second = endpoint.create_qp(qp_config(4)).unwrap();
+
+              assert_eq!(
+                  endpoint.reconfigure_qp(first, qp_config(4)),
+                  Err(ApiError::DuplicateLocalQpn(4))
+              );
+              assert_eq!(endpoint.qp_config(first).unwrap().local_qpn, 2);
+              assert_eq!(endpoint.qp_config(second).unwrap().local_qpn, 4);
+          }
+
+          '''
+          if anchor not in text:
+              raise SystemExit("test insertion anchor not found")
+          path.write_text(text.replace(anchor, regression + anchor, 1))
+      - name: Format
+        run: cargo fmt --all
+      - name: Test workspace
+        run: cargo test --workspace --all-features --all-targets
+      - name: Strict Clippy
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+      - name: Commit reviewed fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/fix-qpn-review-once.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add --all
+          git commit -m 'fix(api): reject duplicate QPNs by exact table slot'
+          git push origin HEAD:feat/initial-rocev2-stack
