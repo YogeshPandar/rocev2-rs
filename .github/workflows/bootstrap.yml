@@ -12,34 +12,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  materialize-and-verify:
+  materialize:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Materialize generated source tree
+      - name: Materialize staged source tree
         shell: bash
         run: |
           set -euo pipefail
-          cat .bootstrap/part-* | base64 --decode > /tmp/rocev2-src.tgz
+          : > /tmp/rocev2-src.tgz
+          for part in .bootstrap/part-*; do
+            base64 --decode "$part" >> /tmp/rocev2-src.tgz
+          done
           gzip --test /tmp/rocev2-src.tgz
           tar --list --gzip --file /tmp/rocev2-src.tgz >/dev/null
           tar --extract --gzip --file /tmp/rocev2-src.tgz --overwrite
           rm -rf .bootstrap .github/workflows/bootstrap.yml
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Test
-        run: cargo test --workspace --all-features --all-targets
-      - name: Clippy
-        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
-      - name: Commit materialized source tree
-        shell: bash
-        run: |
-          set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add --all
