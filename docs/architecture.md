@@ -83,12 +83,41 @@ scheduler alternates requester/responder preference after each successful
 packet, while falling back immediately when the preferred class has no work.
 This prevents either class from starving the other without adding a table scan.
 
+## AF_XDP foundation
+
+The Linux `afxdp` feature maps and registers one UMEM region, then maps the RX,
+TX, fill, and completion rings for one interface queue. RX and TX frames are
+partitioned at construction so one hot-path owner can validate descriptor
+ownership in constant time. Generation-checked frame handles reject stale or
+duplicated application ownership.
+
+The ring wrappers follow AF_XDP's SPSC ownership model. Userspace producers
+load the kernel consumer index with acquire ordering and publish their producer
+index with release ordering. Userspace consumers load the kernel producer index
+with acquire ordering and publish their consumer index with release ordering.
+Descriptor access is confined to reserved ring ranges.
+
+`XDP_USE_NEED_WAKEUP` is always requested. RX polling and TX kicks occur only
+when the relevant ring flag requests them. The backend supports explicit
+zero-copy, explicit copy, and opt-in fallback policies, and verifies the bound
+mode through `XDP_OPTIONS`.
+
+AF_XDP sees Ethernet frames while the transport sees complete IPv4 packets.
+Transmit prepends an untagged Ethernet II header in UMEM. Receive validates the
+EtherType and IPv4 total length directly in the UMEM frame and exposes a
+borrowed IPv4 slice without an intermediate packet allocation. VLAN, QinQ,
+multi-buffer descriptors, and `XDP_USE_SG` are intentionally unsupported in
+this foundation phase. XDP program and XSKMAP management remain a separate
+steering layer.
+
 ## Allocation and unsafe-code policy
 
 No steady-state endpoint operation performs a heap allocation. The raw IPv4
-backend allocates only while opening sockets. A future AF_XDP backend will map
-UMEM and rings during construction, then use caller-owned frames and SPSC rings.
+backend allocates only while opening sockets. AF_XDP allocates its UMEM mapping,
+ring mappings, and fixed frame metadata during construction, then uses only
+caller-owned frames, fixed-capacity metadata, and SPSC rings on the packet path.
 
-`unsafe` is denied workspace-wide and relaxed only in the two crates that cross
-raw pointer or kernel ABI boundaries. Each use is documented next to the
-operation and reviewed against the relevant lifetime/range ownership checks.
+`unsafe` is denied workspace-wide and relaxed only in the crates that cross raw
+pointer or kernel ABI boundaries. AF_XDP unsafe operations are centralized in
+UMEM/ring mappings, descriptor access, and socket syscalls. Each operation
+documents pointer ownership, range, alignment, and mapping lifetime invariants.
