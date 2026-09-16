@@ -1,0 +1,37 @@
+name: offline-review
+
+on:
+  push:
+    branches: [feat/rc-production-hardening]
+    paths: [.github/workflows/offline-review.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt, clippy
+          targets: thumbv7em-none-eabihf
+      - name: Archive source and offline toolchain
+        shell: bash
+        run: |
+          mkdir -p review
+          git archive --format=zip HEAD > review/source.zip
+          cargo vendor --locked review/vendor > review/vendor-config.toml
+          rustc --version --verbose > review/toolchain.txt
+          sysroot="$(rustc --print sysroot)"
+          tar -C "$sysroot" -c bin lib libexec 2>/dev/null | xz -T2 -1 > review/toolchain.tar.xz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: offline-review-${{ github.sha }}
+          path: review
+          retention-days: 1
+          compression-level: 0
