@@ -207,20 +207,26 @@ where
 
     /// Replace queue-pair configuration while it remains in RESET.
     pub fn reconfigure_qp(&mut self, handle: QpHandle, config: QpConfig) -> Result<(), ApiError> {
-        if self.qps.iter().flatten().any(|slot| {
-            slot.machine.config().local_qpn == config.local_qpn
-                && slot.generation != handle.generation()
-        }) {
+        let handle_index = self.qp_index(handle)?;
+        if self
+            .qps
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != handle_index)
+            .filter_map(|(_, slot)| slot.as_ref())
+            .any(|slot| slot.machine.config().local_qpn == config.local_qpn)
+        {
             return Err(ApiError::DuplicateLocalQpn(config.local_qpn));
         }
 
-        let slot = self.qp_slot_mut(handle)?;
+        let slot = self.qps[handle_index]
+            .as_mut()
+            .ok_or(ApiError::InvalidQpHandle)?;
         slot.machine.reconfigure(config)?;
         slot.send_window.reset(config.send_psn);
         slot.receive_psn.reset(config.receive_psn);
         Ok(())
     }
-
     /// Reserve the next requester PSN, respecting the unambiguous send window.
     pub fn reserve_send_psn(&mut self, handle: QpHandle) -> Result<Option<Psn>, ApiError> {
         let slot = self.qp_slot_mut(handle)?;
@@ -475,6 +481,19 @@ mod tests {
         assert_eq!(endpoint.stats().receive_packets, 1);
     }
 
+    #[test]
+    fn reconfigure_rejects_qpn_owned_by_another_same_generation_slot() {
+        let mut endpoint = endpoint();
+        let first = endpoint.create_qp(qp_config(2)).unwrap();
+        let second = endpoint.create_qp(qp_config(4)).unwrap();
+
+        assert_eq!(
+            endpoint.reconfigure_qp(first, qp_config(4)),
+            Err(ApiError::DuplicateLocalQpn(4))
+        );
+        assert_eq!(endpoint.qp_config(first).unwrap().local_qpn, 2);
+        assert_eq!(endpoint.qp_config(second).unwrap().local_qpn, 4);
+    }
     #[test]
     fn rejects_duplicate_local_qpn() {
         let mut endpoint = endpoint();
