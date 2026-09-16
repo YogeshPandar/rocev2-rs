@@ -1,0 +1,58 @@
+name: clippy-fix-once
+
+on:
+  push:
+    branches: [feat/initial-rocev2-stack]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: clippy-fix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fix:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Document intentional BTH wire flags
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("crates/rocev2-wire/src/bth.rs")
+          text = path.read_text()
+          marker = "#[allow(clippy::struct_excessive_bools)]\npub struct Bth"
+          if marker not in text:
+              text = text.replace(
+                  "pub struct Bth",
+                  "// The booleans model independent one-bit BTH wire fields exactly.\n"
+                  "#[allow(clippy::struct_excessive_bools)]\n"
+                  "pub struct Bth",
+                  1,
+              )
+          path.write_text(text)
+      - name: Apply machine-applicable Clippy fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --fix --allow-dirty --allow-staged --workspace --all-features --all-targets || true
+          cargo fmt --all
+      - name: Verify behavior after fixes
+        run: cargo test --workspace --all-features --all-targets
+      - name: Commit fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/clippy-fix-once.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add --all
+          git diff --cached --quiet && exit 0
+          git commit -m 'chore: apply strict Clippy API hygiene fixes'
+          git push origin HEAD:feat/initial-rocev2-stack
