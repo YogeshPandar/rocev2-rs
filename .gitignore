@@ -1,0 +1,9 @@
+/target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+**/*.pcap
+*.profraw
+*.profdata
+perf.data*
+.DS_Store

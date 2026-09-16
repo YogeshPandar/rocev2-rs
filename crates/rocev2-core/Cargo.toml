@@ -1,0 +1,17 @@
+[package]
+name = "rocev2-core"
+description = "no_std RC queue-pair state, PSN arithmetic, segmentation, and retry primitives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rocev2-wire = { path = "../rocev2-wire", version = "0.1.0" }
+
+[lints]
+workspace = true

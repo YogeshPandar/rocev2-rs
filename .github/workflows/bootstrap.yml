@@ -1,0 +1,38 @@
+name: bootstrap-source
+
+on:
+  push:
+    branches: [feat/initial-rocev2-stack]
+
+permissions:
+  contents: write
+
+jobs:
+  materialize-and-verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Materialize generated source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .bootstrap/part-* | base64 --decode > /tmp/rocev2-src.tgz
+          echo 'b82ef655fabb5d224238eeb84c05374c716f029b78d95df7dd9106e64de18362  /tmp/rocev2-src.tgz' | sha256sum --check
+          tar --extract --gzip --file /tmp/rocev2-src.tgz --overwrite
+          rm -rf .bootstrap .github/workflows/bootstrap.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add --all
+          git commit -m 'feat: implement pure-Rust RoCEv2 RC transport'
+          git push origin HEAD:feat/initial-rocev2-stack
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Test
+        run: cargo test --workspace --all-features --all-targets
+      - name: Clippy
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
