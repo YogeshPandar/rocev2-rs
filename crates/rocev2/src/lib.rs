@@ -1,4 +1,4 @@
-//! Pure-Rust userspace RoCEv2 Reliable Connected transport foundations.
+//! Pure-Rust userspace `RoCEv2` Reliable Connected transport foundations.
 //!
 //! The public crate composes four independently testable layers:
 //!

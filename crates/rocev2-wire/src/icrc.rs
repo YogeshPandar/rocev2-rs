@@ -14,11 +14,13 @@ pub struct Icrc {
 
 impl Icrc {
     /// Start a RoCE ICRC calculation with the Annex A16/A17 seed.
+    #[must_use]
     pub const fn new() -> Self {
         Self { state: ICRC_SEED }
     }
 
     /// Start a generic reflected CRC-32 calculation with a custom seed.
+    #[must_use]
     pub const fn with_seed(seed: u32) -> Self {
         Self { state: seed }
     }
@@ -37,16 +39,18 @@ impl Icrc {
     }
 
     /// Return the uncomplemented running state.
+    #[must_use]
     pub const fn state(self) -> u32 {
         self.state
     }
 
     /// Finish the ICRC by complementing the running state.
+    #[must_use]
     pub const fn finalize(self) -> u32 {
         !self.state
     }
 
-    /// Compute an IPv4 RoCEv2 ICRC over IPv4, UDP, and transport bytes.
+    /// Compute an IPv4 `RoCEv2` ICRC over IPv4, UDP, and transport bytes.
     ///
     /// `transport_without_icrc` starts at the BTH and includes any payload and
     /// zero padding, but excludes the four-byte ICRC field itself.
@@ -59,7 +63,7 @@ impl Icrc {
             return Err(WireError::InvalidIpv4Header);
         }
         let ihl = usize::from(ipv4_header[0] & 0x0f) * 4;
-        if ihl < 20 || ihl > 60 || ipv4_header.len() < ihl {
+        if !(20..=60).contains(&ihl) || ipv4_header.len() < ihl {
             return Err(WireError::InvalidIpv4Header);
         }
         if udp_header.len() < 8 {

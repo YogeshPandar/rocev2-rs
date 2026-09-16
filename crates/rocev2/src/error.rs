@@ -35,7 +35,7 @@ pub enum ApiError {
     InvalidIpv4Protocol(u8),
     /// IPv4 fragmentation is not supported by the v1 data path.
     FragmentedIpv4,
-    /// The UDP destination port was not the RoCEv2 port.
+    /// The UDP destination port was not the `RoCEv2` port.
     InvalidRoceDestinationPort(u16),
     /// A UDP length field was invalid or inconsistent with IPv4.
     InvalidUdpLength {

@@ -29,7 +29,7 @@ pub(crate) unsafe fn copy_from_registered(pointer: NonNull<u8>, offset: usize, o
             pointer.as_ptr().add(offset),
             output.as_mut_ptr(),
             output.len(),
-        )
+        );
     };
 }
 

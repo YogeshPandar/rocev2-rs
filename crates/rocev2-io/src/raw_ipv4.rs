@@ -66,7 +66,7 @@ impl RawIpv4Socket {
                 descriptor.as_raw_fd(),
                 libc::IPPROTO_IP,
                 libc::IP_HDRINCL,
-                (&enabled as *const libc::c_int).cast(),
+                (&raw const enabled).cast(),
                 option_length,
             )
         };
@@ -83,7 +83,7 @@ impl RawIpv4Socket {
         let bind_result = unsafe {
             libc::bind(
                 descriptor.as_raw_fd(),
-                (&local as *const libc::sockaddr_in).cast(),
+                (&raw const local).cast(),
                 address_length,
             )
         };
@@ -122,7 +122,7 @@ impl PacketIo for RawIpv4Socket {
                 packet.as_ptr().cast(),
                 packet.len(),
                 0,
-                (&remote as *const libc::sockaddr_in).cast(),
+                (&raw const remote).cast(),
                 address_length,
             )
         };

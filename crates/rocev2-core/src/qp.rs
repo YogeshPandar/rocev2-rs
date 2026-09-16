@@ -233,13 +233,14 @@ const fn is_legal_transition(from: QpState, to: QpState) -> bool {
                 QpState::Init,
                 QpState::Reset | QpState::Rtr | QpState::Error
             )
-            | (QpState::Rtr, QpState::Reset | QpState::Rts | QpState::Error)
+            | (
+                QpState::Rtr | QpState::Sqd | QpState::Sqe,
+                QpState::Reset | QpState::Rts | QpState::Error
+            )
             | (
                 QpState::Rts,
                 QpState::Reset | QpState::Sqd | QpState::Sqe | QpState::Error
             )
-            | (QpState::Sqd, QpState::Reset | QpState::Rts | QpState::Error)
-            | (QpState::Sqe, QpState::Reset | QpState::Rts | QpState::Error)
             | (QpState::Error, QpState::Reset)
     )
 }

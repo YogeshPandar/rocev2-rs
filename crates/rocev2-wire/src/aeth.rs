@@ -61,6 +61,7 @@ impl Aeth {
     pub const NAK_REMOTE_OPERATION_ERROR: u8 = 0x63;
 
     /// Construct an unlimited-credit ACK.
+    #[must_use]
     pub const fn ack(message_sequence_number: u32) -> Self {
         Self {
             syndrome: Self::ACK_UNLIMITED,
@@ -69,6 +70,7 @@ impl Aeth {
     }
 
     /// Construct an RNR NAK.
+    #[must_use]
     pub const fn rnr_nak(message_sequence_number: u32, timer: u8) -> Self {
         Self {
             syndrome: Self::RNR_NAK | (timer & 0x1f),
@@ -77,6 +79,7 @@ impl Aeth {
     }
 
     /// Construct a PSN sequence-error NAK.
+    #[must_use]
     pub const fn psn_nak(message_sequence_number: u32) -> Self {
         Self {
             syndrome: Self::NAK_PSN_SEQUENCE_ERROR,
@@ -119,6 +122,7 @@ impl Aeth {
     }
 
     /// Classify the syndrome without discarding implementation-defined values.
+    #[must_use]
     pub const fn class(self) -> AethClass {
         match self.syndrome & 0xe0 {
             0x00 => AethClass::Ack {

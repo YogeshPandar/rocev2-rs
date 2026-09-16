@@ -1,6 +1,6 @@
 use crate::WireError;
 
-/// Fixed IPv4 header length used by the v1 RoCEv2 data path.
+/// Fixed IPv4 header length used by the v1 `RoCEv2` data path.
 pub const IPV4_HEADER_LEN: usize = 20;
 /// UDP header length.
 pub const UDP_HEADER_LEN: usize = 8;
@@ -34,6 +34,7 @@ pub struct Ipv4Header {
 
 impl Ipv4Header {
     /// Construct a non-fragmented UDP header.
+    #[must_use]
     pub const fn udp(source: [u8; 4], destination: [u8; 4], total_length: u16) -> Self {
         Self {
             dscp_ecn: 0,
@@ -117,7 +118,7 @@ impl Ipv4Header {
 /// UDP header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UdpHeader {
-    /// Source UDP port. RoCEv2 commonly derives this from a flow hash.
+    /// Source UDP port. `RoCEv2` commonly derives this from a flow hash.
     pub source_port: u16,
     /// Destination UDP port; normally 4791.
     pub destination_port: u16,

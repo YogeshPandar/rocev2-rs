@@ -10,8 +10,10 @@ const QPN_RESERVED_MASK: u32 = 0x3f00_0000;
 const ACK_MASK: u32 = 0x8000_0000;
 const APSN_RESERVED_MASK: u32 = 0x7f00_0000;
 
-/// InfiniBand Base Transport Header carried by RoCEv2.
+/// InfiniBand Base Transport Header carried by `RoCEv2`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// The booleans model independent one-bit BTH wire fields exactly.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Bth {
     /// RC operation opcode.
     pub opcode: Opcode,
@@ -42,6 +44,7 @@ impl Bth {
     pub const DEFAULT_PKEY: u16 = 0xffff;
 
     /// Construct a conventional RC BTH.
+    #[must_use]
     pub const fn new(opcode: Opcode, destination_qpn: u32, psn: u32) -> Self {
         Self {
             opcode,

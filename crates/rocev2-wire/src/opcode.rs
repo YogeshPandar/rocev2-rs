@@ -98,11 +98,13 @@ impl Opcode {
     }
 
     /// Numeric wire value.
+    #[must_use]
     pub const fn as_u8(self) -> u8 {
         self as u8
     }
 
     /// Logical operation.
+    #[must_use]
     pub const fn operation(self) -> Operation {
         match self {
             Self::SendFirst
@@ -127,6 +129,7 @@ impl Opcode {
     }
 
     /// Segmentation position.
+    #[must_use]
     pub const fn position(self) -> SegmentPosition {
         match self {
             Self::SendFirst | Self::RdmaWriteFirst | Self::RdmaReadResponseFirst => {
@@ -151,6 +154,7 @@ impl Opcode {
     }
 
     /// Whether a RETH follows the BTH.
+    #[must_use]
     pub const fn has_reth(self) -> bool {
         matches!(
             self,
@@ -162,6 +166,7 @@ impl Opcode {
     }
 
     /// Whether an AETH follows the BTH.
+    #[must_use]
     pub const fn has_aeth(self) -> bool {
         matches!(
             self,
@@ -173,6 +178,7 @@ impl Opcode {
     }
 
     /// Whether this opcode includes an immediate-data header.
+    #[must_use]
     pub const fn has_immediate(self) -> bool {
         matches!(
             self,
@@ -184,6 +190,7 @@ impl Opcode {
     }
 
     /// Length of transport headers before immediate data and payload.
+    #[must_use]
     pub const fn fixed_header_len(self) -> usize {
         BTH_LEN
             + if self.has_reth() { RETH_LEN } else { 0 }
@@ -191,11 +198,13 @@ impl Opcode {
     }
 
     /// Whether the opcode may carry a payload.
+    #[must_use]
     pub const fn allows_payload(self) -> bool {
         !matches!(self, Self::RdmaReadRequest | Self::Acknowledge)
     }
 
     /// Whether this packet is sent by an RC requester.
+    #[must_use]
     pub const fn is_request(self) -> bool {
         matches!(
             self.operation(),
@@ -204,6 +213,7 @@ impl Opcode {
     }
 
     /// Whether this packet is sent by an RC responder.
+    #[must_use]
     pub const fn is_response(self) -> bool {
         !self.is_request()
     }

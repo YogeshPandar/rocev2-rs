@@ -70,7 +70,7 @@ struct QpSlot {
     receive_psn: ReceivePsn,
 }
 
-/// A fixed-capacity RoCEv2 endpoint over a caller-selected packet backend.
+/// A fixed-capacity `RoCEv2` endpoint over a caller-selected packet backend.
 ///
 /// This type provides strict complete-packet I/O, queue-pair lifecycle,
 /// packet-sequence bookkeeping, and QP routing. It does not yet execute posted
@@ -255,7 +255,7 @@ where
         Ok(slot.receive_psn.observe(received))
     }
 
-    /// Encode and transmit one complete RoCEv2 packet.
+    /// Encode and transmit one complete `RoCEv2` packet.
     pub fn transmit(
         &mut self,
         path: Ipv4Path,

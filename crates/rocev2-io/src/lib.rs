@@ -1,8 +1,8 @@
-//! Packet I/O abstractions for the RoCEv2 data plane.
+//! Packet I/O abstractions for the `RoCEv2` data plane.
 //!
 //! The central trait exchanges complete IPv4 packets in caller-owned buffers.
 //! This keeps transport parsing independent from Linux syscalls and permits an
-//! AF_XDP backend to prepend or strip Ethernet without changing RC logic.
+//! `AF_XDP` backend to prepend or strip Ethernet without changing RC logic.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 

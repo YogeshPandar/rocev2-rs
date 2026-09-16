@@ -9,7 +9,7 @@ use rocev2_wire::{
 /// Minimum complete IPv4 packet carrying BTH and ICRC.
 pub const MIN_ROCE_IPV4_PACKET: usize = IPV4_HEADER_LEN + UDP_HEADER_LEN + 12 + 4;
 
-/// IPv4 and UDP fields used when encoding one RoCEv2 packet.
+/// IPv4 and UDP fields used when encoding one `RoCEv2` packet.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Ipv4Path {
     /// Source IPv4 address.
@@ -38,7 +38,7 @@ impl Ipv4Path {
     }
 }
 
-/// Borrowed, validated complete RoCEv2 packet.
+/// Borrowed, validated complete `RoCEv2` packet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DecodedPacket<'a> {
     /// Validated fixed-size IPv4 header.
@@ -49,7 +49,7 @@ pub struct DecodedPacket<'a> {
     pub transport: PacketRef<'a>,
 }
 
-/// Decode and validate a complete IPv4 RoCEv2 packet.
+/// Decode and validate a complete IPv4 `RoCEv2` packet.
 ///
 /// The decoder rejects IPv4 options and fragmentation, requires an exact IPv4
 /// and UDP length match, requires UDP destination port 4791, parses transport
@@ -113,7 +113,7 @@ pub fn decode_ipv4_packet(input: &[u8]) -> Result<DecodedPacket<'_>, ApiError> {
 /// Encode a complete IPv4/UDP/RoCEv2 packet into caller-owned storage.
 ///
 /// IPv4 fragmentation is disabled and the IPv4 UDP checksum is emitted as
-/// zero, which is valid for IPv4. The RoCEv2 ICRC is always calculated.
+/// zero, which is valid for IPv4. The `RoCEv2` ICRC is always calculated.
 pub fn encode_ipv4_packet(
     path: Ipv4Path,
     transport: PacketSpec<'_>,
@@ -174,7 +174,7 @@ mod tests {
     use super::*;
     use rocev2_wire::{Bth, Opcode};
 
-    fn packet_spec<'a>(payload: &'a [u8]) -> PacketSpec<'a> {
+    fn packet_spec(payload: &[u8]) -> PacketSpec<'_> {
         PacketSpec {
             bth: Bth::new(Opcode::SendOnly, 2, 7),
             reth: None,

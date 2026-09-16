@@ -187,8 +187,9 @@ pub struct PacketSpec<'a> {
     pub payload: &'a [u8],
 }
 
-impl<'a> PacketSpec<'a> {
+impl PacketSpec<'_> {
     /// Number of pad bytes required by the four-byte transport alignment rule.
+    #[must_use]
     pub const fn pad_count(&self) -> usize {
         (4 - (self.payload.len() & 3)) & 3
     }
@@ -256,7 +257,7 @@ impl<'a> PacketSpec<'a> {
         Ok(cursor)
     }
 
-    /// Encode a complete transport packet and calculate its IPv4 RoCEv2 ICRC.
+    /// Encode a complete transport packet and calculate its IPv4 `RoCEv2` ICRC.
     pub fn encode_with_icrc(
         &self,
         ipv4_header: &[u8],

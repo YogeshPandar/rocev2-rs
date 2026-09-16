@@ -1,7 +1,7 @@
-//! RoCEv2 wire-format support.
+//! `RoCEv2` wire-format support.
 //!
 //! This crate is dependency-free and `no_std`. It parses and encodes the
-//! InfiniBand transport headers carried by a RoCEv2 UDP datagram, and computes
+//! InfiniBand transport headers carried by a `RoCEv2` UDP datagram, and computes
 //! the invariant CRC (ICRC) used by RoCE.
 //!
 //! The parser never dereferences packet-provided addresses and never allocates.
@@ -27,7 +27,7 @@ pub use opcode::{Opcode, Operation, SegmentPosition};
 pub use packet::{PacketRef, PacketSpec, ParseOptions};
 pub use reth::Reth;
 
-/// IANA-assigned RoCEv2 UDP destination port.
+/// IANA-assigned `RoCEv2` UDP destination port.
 pub const ROCE_V2_UDP_PORT: u16 = 4791;
 
 /// Base Transport Header length in bytes.
