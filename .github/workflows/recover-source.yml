@@ -4,50 +4,26 @@ on:
   push:
     branches: [feat/initial-rocev2-stack]
 
-permissions:
-  contents: write
-
-concurrency:
-  group: recover-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  recover-and-verify:
+  validate-historical-archive:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Reconstruct historical source archive
+      - name: Validate normalized historical archive
         shell: bash
         run: |
           set -euo pipefail
           historical_commit=4278ca1e79967e0861190ec4bbfb764d6fcc1905
           : > /tmp/rocev2-src.b64
           for index in 00 01 02 03 04 05 06 07 08; do
-            git show "${historical_commit}:.bootstrap/part-${index}" >> /tmp/rocev2-src.b64
+            git show "${historical_commit}:.bootstrap/part-${index}" | tr -cd 'A-Za-z0-9+/' >> /tmp/rocev2-src.b64
           done
-          base64 --decode --ignore-garbage /tmp/rocev2-src.b64 > /tmp/rocev2-src.tgz
+          remainder=$(( $(wc -c < /tmp/rocev2-src.b64) % 4 ))
+          if [ "$remainder" -eq 2 ]; then printf '==' >> /tmp/rocev2-src.b64; fi
+          if [ "$remainder" -eq 3 ]; then printf '=' >> /tmp/rocev2-src.b64; fi
+          if [ "$remainder" -eq 1 ]; then exit 1; fi
+          base64 --decode /tmp/rocev2-src.b64 > /tmp/rocev2-src.tgz
           gzip --test /tmp/rocev2-src.tgz
           tar --list --gzip --file /tmp/rocev2-src.tgz
-          tar --extract --gzip --file /tmp/rocev2-src.tgz --overwrite
-          rm .github/workflows/recover-source.yml
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Test
-        run: cargo test --workspace --all-features --all-targets
-      - name: Clippy
-        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
-      - name: Commit verified recovered source
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add --all
-          git diff --cached --quiet && exit 0
-          git commit -m 'feat: restore verified RoCEv2 workspace source'
-          git push origin HEAD:feat/initial-rocev2-stack
