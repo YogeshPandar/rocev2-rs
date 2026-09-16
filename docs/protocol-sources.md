@@ -28,6 +28,8 @@ appears to differ.
   <https://github.com/torvalds/linux/blob/master/drivers/infiniband/sw/rxe/rxe_opcode.c>
 - Linux RXE requester state and RDMA READ PSN reservation:
   <https://github.com/torvalds/linux/blob/master/drivers/infiniband/sw/rxe/rxe_req.c>
+- Linux RXE task wakeup coalescing and bounded requester/responder scheduling:
+  <https://github.com/torvalds/linux/blob/master/drivers/infiniband/sw/rxe/rxe_task.c>
 - Linux RXE responder, duplicate suppression and READ replay:
   <https://github.com/torvalds/linux/blob/master/drivers/infiniband/sw/rxe/rxe_resp.c>
 - Linux RXE ICRC canonicalization and seed:

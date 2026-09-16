@@ -13,6 +13,7 @@ mod qp;
 mod qpn;
 mod retry;
 mod ring;
+mod scheduler;
 mod segment;
 mod work;
 
@@ -25,6 +26,7 @@ pub use retry::{
     rnr_timer_microseconds, rnr_timer_ticks,
 };
 pub use ring::{PushError, Ring};
+pub use scheduler::{ReadyQueue, TimerEntry, TimerScheduler};
 pub use segment::{Segment, SegmentError, Segmenter, TransferKind};
 pub use work::{
     Completion, CompletionOpcode, CompletionStatus, RecvWorkRequest, Sge, WorkRequest,
