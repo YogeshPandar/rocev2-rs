@@ -1,92 +1,111 @@
 # rocev2-rs
 
 A pure-Rust userspace RoCEv2 transport for IPv4 Reliable Connected queue pairs.
-The data path implements protocol state itself; it does not forward operations
-to libibverbs, librdmacm, UCX, rdma-core, or Linux RXE.
+The data path implements the transport itself; it does not forward SEND, RDMA
+WRITE, or RDMA READ operations to libibverbs, librdmacm, UCX, rdma-core, or
+Linux RXE.
 
-> **Status:** pre-1.0 engineering preview. The wire/core/memory layers and a
-> deterministic endpoint engine are implemented and tested in software. Do not
-> use it to expose untrusted memory or production traffic until RXE and hardware
-> interoperability suites, long-running loss/reorder tests, fuzzing, and an
-> external unsafe-code review are complete.
+> **Status: pre-1.0 engineering preview.** A fixed-capacity RC execution engine
+> now posts and executes SEND, WRITE, and READ in deterministic software tests,
+> including completions, segmentation, ACK/NAK/RNR, duplicate suppression, and
+> retry scheduling. Linux RXE and hardware-RNIC interoperability, production
+> AF_XDP, sustained fuzzing, and performance qualification are still release
+> blockers. Do not expose untrusted memory or production traffic yet.
 
 ## Workspace
 
 | Crate | Purpose |
 |---|---|
-| `rocev2-wire` | `no_std`, allocation-free BTH/RETH/AETH, IPv4/UDP and ICRC |
-| `rocev2-core` | `no_std` RC PSN/QP/retry/segmentation state machines |
-| `rocev2-memory` | checked lkey/rkey registration and remote access |
-| `rocev2-io` | MockIO, raw IPv4 and AF_XDP packet backends |
-| `rocev2` | endpoint, QP table and native Rust API |
+| `rocev2-wire` | `no_std`, allocation-free BTH/RETH/AETH, IPv4/UDP, and ICRC |
+| `rocev2-core` | `no_std` PSN, QP, retry, segmentation, and fixed-ring primitives |
+| `rocev2-memory` | generation-tagged lkey/rkey registration and checked access |
+| `rocev2-io` | backend-neutral packet I/O, deterministic mock I/O, and raw IPv4 |
+| `rocev2` | endpoint composition and fixed-capacity RC posted-work engine |
 
-The implemented v1 scope is IPv4 RoCEv2 RC SEND, RDMA WRITE and RDMA READ,
-including MTU segmentation, PSN rollover arithmetic, ACK/NAK/RNR handling,
-retries, duplicate suppression, READ replay and strict ICRC verification.
-Connection metadata is exchanged out of band; RDMA-CM is not part of this
-release.
+The current scope is deliberately narrow: RoCEv2 over IPv4, RC QPs, one SGE
+per WQE, and SEND/RDMA WRITE/RDMA READ. Connection metadata is exchanged out of
+band; RDMA-CM is not part of the current implementation.
 
-## Example
+## Posted-work engine
+
+`RcEndpoint` owns a fixed QP table, fixed SQ/RQ/CQ rings, a checked memory
+registry, and one packet of scratch space. QPs and their rings allocate only on
+the control path. Once the endpoint, QPs, and MRs exist, posting, polling,
+packet parsing/encoding, ACK processing, memory copies, and retries do not
+perform transport-owned heap allocations.
 
 ```rust,no_run
+use std::net::Ipv4Addr;
 use rocev2::{
-    Access, Endpoint, EndpointConfig, Ipv4Path, PathMtu, Psn, QpConfig, Sge,
-    WorkRequest, WorkRequestKind,
+    AccessFlags, Ipv4Path, PathMtu, Psn, QpConfig, QpState, RcEndpoint,
+    RcEndpointConfig, RcQpConfig, Sge, WorkRequest,
 };
 use rocev2::io::{RawIpv4Config, RawIpv4Socket};
 
-type HostEndpoint<'a> = Endpoint<'a, RawIpv4Socket, 1024, 4096, 256, 256, 512, 8192>;
+type HostEndpoint<'a> = RcEndpoint<'a, RawIpv4Socket, 1024, 4096, 128, 128, 256>;
 
 # fn run() -> Result<(), Box<dyn std::error::Error>> {
 let local_ip = [192, 0, 2, 10];
 let remote_ip = [192, 0, 2, 20];
-let socket = RawIpv4Socket::open(RawIpv4Config::new(local_ip))?;
-let mut endpoint = HostEndpoint::new(socket, EndpointConfig::new(local_ip, 0x5eed))?;
+let io = RawIpv4Socket::bind(RawIpv4Config {
+    bind_address: Ipv4Addr::from(local_ip),
+    max_ipv4_packet: 4600,
+})?;
+let mut endpoint = HostEndpoint::new(
+    io,
+    RcEndpointConfig {
+        maximum_packet_size: 4600,
+        ticks_per_second: 1_000_000_000,
+        memory_key_seed: 0x5eed,
+    },
+)?;
 
 let mut buffer = [0_u8; 4096];
 let mr = endpoint.register_memory(
     &mut buffer,
-    Access::LOCAL_READ | Access::LOCAL_WRITE,
+    AccessFlags::LOCAL_WRITE
+        | AccessFlags::REMOTE_WRITE
+        | AccessFlags::REMOTE_READ,
 )?;
 
-// QPNs, PSNs, MTU, rkey and remote virtual address come from an out-of-band
-// authenticated control plane.
-let qp = endpoint.create_connected_qp(
-    QpConfig {
+// QPNs, PSNs, MTU, rkey, and remote virtual address come from an
+// authenticated out-of-band control plane.
+let qp = endpoint.create_qp(RcQpConfig {
+    transport: QpConfig {
         local_qpn: 0x100,
         remote_qpn: 0x200,
-        send_psn: Psn::wrapping(0x123456),
-        receive_psn: Psn::wrapping(0x654321),
+        send_psn: Psn::new_truncated(0x123456),
+        receive_psn: Psn::new_truncated(0x654321),
         path_mtu: PathMtu::Mtu1024,
-        ack_timeout_ticks: 1_000_000,
         retry_count: 3,
         rnr_retry_count: 3,
-        min_rnr_timer: 12,
+        timeout: 14,
     },
-    Ipv4Path::new(local_ip, remote_ip, 50_000),
-)?;
+    path: Ipv4Path::new(local_ip, remote_ip, 50_000),
+    rnr_nak_timer: 12,
+})?;
+endpoint.transition_qp(qp, QpState::Init)?;
+endpoint.transition_qp(qp, QpState::Rtr)?;
+endpoint.transition_qp(qp, QpState::Rts)?;
 
-endpoint.post_send(
+endpoint.post_work(
     qp,
-    WorkRequest {
-        work_request_id: 1,
-        local: Sge {
-            address: mr.address,
-            length: 4096,
-            local_key: mr.local_key,
-        },
-        kind: WorkRequestKind::Write {
-            remote_address: 0x7f00_0000_0000,
-            remote_key: 0x1234_5678,
-        },
-        solicited: false,
-    },
+    WorkRequest::write(
+        1,
+        Sge::new(mr.address(), 4096, mr.lkey()),
+        0x7f00_0000_0000,
+        0x1234_5678,
+        true,
+    ),
 )?;
 
+let mut receive_packet = [0_u8; 4600];
+let mut transmit_packet = [0_u8; 4600];
 loop {
-    endpoint.poll(monotonic_nanoseconds())?;
+    let now = monotonic_nanoseconds();
+    endpoint.progress(now, &mut receive_packet, &mut transmit_packet)?;
     if let Some(completion) = endpoint.poll_completion(qp)? {
-        assert_eq!(completion.work_request_id, 1);
+        completion.is_success().then_some(()).ok_or("RDMA operation failed")?;
         break;
     }
 }
@@ -95,9 +114,22 @@ loop {
 # fn monotonic_nanoseconds() -> u64 { 0 }
 ```
 
-Raw IPv4 requires `CAP_NET_RAW` and is intended as a correctness/reference
-backend. AF_XDP setup requires a bound queue and an XDP program/XSKMAP; see
-[`docs/af-xdp.md`](docs/af-xdp.md).
+Raw IPv4 requires `CAP_NET_RAW` and is the correctness/reference backend, not
+the intended final high-throughput path.
+
+## Correctness model
+
+Incoming network addresses are never dereferenced directly. Every local or
+remote operation passes through exact key lookup, access checks, checked address
+arithmetic, registered-range containment, and only then the audited raw copy
+boundary. Responder side effects occur only for the exactly expected PSN;
+duplicates are ACKed or replayed without repeating writes, while future PSNs
+produce a sequence NAK. RDMA READ reserves the complete response PSN span before
+the request is transmitted.
+
+See [implementation status](docs/status.md), [architecture](docs/architecture.md),
+and [protocol sources](docs/protocol-sources.md) for the current qualification
+boundary and the primary references used by the implementation.
 
 ## Validation
 
@@ -109,9 +141,5 @@ cargo check -p rocev2-wire --target thumbv7em-none-eabihf
 cargo check -p rocev2-core --target thumbv7em-none-eabihf
 cargo check -p rocev2-memory --target thumbv7em-none-eabihf
 ```
-
-Protocol sources and exact Linux interoperability references are recorded in
-[`docs/protocol-sources.md`](docs/protocol-sources.md). The architecture and
-unsafe-code policy are in [`docs/architecture.md`](docs/architecture.md).
 
 Dual-licensed under MIT or Apache-2.0.

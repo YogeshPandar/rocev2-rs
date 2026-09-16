@@ -329,6 +329,68 @@ impl<'a, const N: usize> MemoryRegistry<'a, N> {
         Ok(unsafe { raw::slice_from_raw_parts_mut(slot.pointer, slot.length) })
     }
 
+    /// Validate a locally readable range without copying data.
+    pub fn validate_local_read(
+        &self,
+        lkey: u32,
+        address: u64,
+        length: usize,
+    ) -> Result<(), MemoryError> {
+        self.resolve(lkey, KeyKind::Local, AccessFlags::NONE, address, length)
+            .map(|_| ())
+    }
+
+    /// Validate a locally writable range without copying data.
+    pub fn validate_local_write(
+        &self,
+        lkey: u32,
+        address: u64,
+        length: usize,
+    ) -> Result<(), MemoryError> {
+        self.resolve(
+            lkey,
+            KeyKind::Local,
+            AccessFlags::LOCAL_WRITE,
+            address,
+            length,
+        )
+        .map(|_| ())
+    }
+
+    /// Validate a remotely readable range without copying data.
+    pub fn validate_remote_read(
+        &self,
+        rkey: u32,
+        address: u64,
+        length: usize,
+    ) -> Result<(), MemoryError> {
+        self.resolve(
+            rkey,
+            KeyKind::Remote,
+            AccessFlags::REMOTE_READ,
+            address,
+            length,
+        )
+        .map(|_| ())
+    }
+
+    /// Validate a remotely writable range without copying data.
+    pub fn validate_remote_write(
+        &self,
+        rkey: u32,
+        address: u64,
+        length: usize,
+    ) -> Result<(), MemoryError> {
+        self.resolve(
+            rkey,
+            KeyKind::Remote,
+            AccessFlags::REMOTE_WRITE,
+            address,
+            length,
+        )
+        .map(|_| ())
+    }
+
     /// Copy from a locally registered source after validating its lkey.
     pub fn read_local(
         &mut self,
@@ -568,6 +630,27 @@ mod tests {
             Err(MemoryError::InvalidKey)
         );
         assert_eq!(returned[0], 5);
+    }
+
+    #[test]
+    fn validation_checks_full_range_without_touching_memory() {
+        let mut memory = [0_u8; 8];
+        let registry_access = AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ;
+        let mut registry = MemoryRegistry::<1>::new(17).unwrap();
+        let region = registry.register(&mut memory, registry_access).unwrap();
+
+        assert_eq!(
+            registry.validate_local_write(region.lkey(), region.address(), 8),
+            Ok(())
+        );
+        assert_eq!(
+            registry.validate_remote_read(region.rkey(), region.address() + 7, 2),
+            Err(MemoryError::RangeOutOfBounds)
+        );
+        assert_eq!(
+            registry.validate_remote_write(region.rkey(), region.address(), 1),
+            Err(MemoryError::AccessDenied)
+        );
     }
 
     #[test]

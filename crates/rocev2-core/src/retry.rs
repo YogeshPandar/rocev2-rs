@@ -194,6 +194,22 @@ impl Timer {
     }
 }
 
+/// Convert the five-bit RC local ACK timeout code to caller timer ticks.
+///
+/// InfiniBand defines the timeout as `4.096 microseconds * 2^code`. The
+/// conversion rounds up so a configured timeout is never shortened.
+#[must_use]
+pub fn ack_timeout_ticks(code: u8, ticks_per_second: u64) -> Option<u64> {
+    if code >= 32 || ticks_per_second == 0 {
+        return None;
+    }
+
+    let nanoseconds = 4_096_u128.checked_shl(u32::from(code))?;
+    let numerator = nanoseconds.checked_mul(u128::from(ticks_per_second))?;
+    let ticks = numerator.div_ceil(1_000_000_000);
+    u64::try_from(ticks).ok()
+}
+
 /// Convert a five-bit AETH RNR timer code to microseconds.
 #[must_use]
 pub fn rnr_timer_microseconds(code: u8) -> Option<u64> {
@@ -222,6 +238,14 @@ pub fn rnr_timer_ticks(code: u8, ticks_per_second: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ack_timeout_conversion_matches_wire_code() {
+        assert_eq!(ack_timeout_ticks(0, 1_000_000), Some(5));
+        assert_eq!(ack_timeout_ticks(14, 1_000_000), Some(67_109));
+        assert_eq!(ack_timeout_ticks(32, 1_000_000), None);
+        assert_eq!(ack_timeout_ticks(1, 0), None);
+    }
 
     #[test]
     fn rnr_table_matches_edge_codes() {
