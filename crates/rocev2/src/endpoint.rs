@@ -1,11 +1,13 @@
 //! Fixed-capacity endpoint composition over a packet backend.
 
+use crate::qp::{insert_qpn, qpn_slot, validate_qpn_index};
 use crate::{
     ApiError, DecodedPacket, Ipv4Path, MIN_ROCE_IPV4_PACKET, PollError, QpHandle,
     decode_ipv4_packet, encode_ipv4_packet,
 };
 use rocev2_core::{
-    AckAdvance, Psn, QpConfig, QpState, QpStateMachine, ReceiveDisposition, ReceivePsn, SendWindow,
+    AckAdvance, Psn, QpConfig, QpState, QpStateMachine, QpnTable, ReceiveDisposition, ReceivePsn,
+    SendWindow,
 };
 use rocev2_io::PacketIo;
 use rocev2_wire::{Opcode, PacketSpec};
@@ -76,15 +78,19 @@ struct QpSlot {
 /// packet-sequence bookkeeping, and QP routing. It does not yet execute posted
 /// SEND/READ/WRITE work requests; that executor is deliberately kept separate
 /// from these already testable protocol foundations.
-pub struct Endpoint<Io, const QPS: usize = 1024> {
+///
+/// `QPN_INDEX` must be a power of two and at least twice `QPS`. The default
+/// keeps the fixed open-addressed QPN table at or below 50 percent load.
+pub struct Endpoint<Io, const QPS: usize = 1024, const QPN_INDEX: usize = 2048> {
     io: Io,
     config: EndpointConfig,
     stats: EndpointStats,
     qps: [Option<QpSlot>; QPS],
     generations: [u32; QPS],
+    qpn_index: Box<QpnTable<QPN_INDEX>>,
 }
 
-impl<Io, const QPS: usize> Endpoint<Io, QPS>
+impl<Io, const QPS: usize, const QPN_INDEX: usize> Endpoint<Io, QPS, QPN_INDEX>
 where
     Io: PacketIo,
 {
@@ -104,6 +110,7 @@ where
                 backend: backend_maximum,
             });
         }
+        validate_qpn_index::<QPS, QPN_INDEX>()?;
 
         Ok(Self {
             io,
@@ -111,6 +118,7 @@ where
             stats: EndpointStats::default(),
             qps: core::array::from_fn(|_| None),
             generations: [0; QPS],
+            qpn_index: Box::new(QpnTable::new()),
         })
     }
 
@@ -144,12 +152,7 @@ where
 
     /// Create a validated queue pair in RESET state.
     pub fn create_qp(&mut self, config: QpConfig) -> Result<QpHandle, ApiError> {
-        if self
-            .qps
-            .iter()
-            .flatten()
-            .any(|slot| slot.machine.config().local_qpn == config.local_qpn)
-        {
+        if self.qpn_index.get(config.local_qpn).is_some() {
             return Err(ApiError::DuplicateLocalQpn(config.local_qpn));
         }
 
@@ -159,6 +162,7 @@ where
             .iter()
             .position(Option::is_none)
             .ok_or(ApiError::QpTableFull)?;
+        let slot_number = insert_qpn(&mut self.qpn_index, config.local_qpn, index)?;
         let generation = self.generations[index].wrapping_add(1).max(1);
         self.generations[index] = generation;
         self.qps[index] = Some(QpSlot {
@@ -168,15 +172,17 @@ where
             receive_psn: ReceivePsn::new(config.receive_psn),
         });
 
-        let slot = u32::try_from(index).map_err(|_| ApiError::QpTableFull)?;
-        Ok(QpHandle::new(slot, generation))
+        Ok(QpHandle::new(slot_number, generation))
     }
 
     /// Remove a queue pair and invalidate its handle.
     pub fn remove_qp(&mut self, handle: QpHandle) -> Result<QpConfig, ApiError> {
         let index = self.qp_index(handle)?;
         let slot = self.qps[index].take().ok_or(ApiError::InvalidQpHandle)?;
-        Ok(slot.machine.config())
+        let config = slot.machine.config();
+        let removed = self.qpn_index.remove(config.local_qpn);
+        debug_assert_eq!(removed, Some(handle.slot()));
+        Ok(config)
     }
 
     /// Return the current state for a live queue pair.
@@ -209,20 +215,30 @@ where
     pub fn reconfigure_qp(&mut self, handle: QpHandle, config: QpConfig) -> Result<(), ApiError> {
         let handle_index = self.qp_index(handle)?;
         if self
-            .qps
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != handle_index)
-            .filter_map(|(_, slot)| slot.as_ref())
-            .any(|slot| slot.machine.config().local_qpn == config.local_qpn)
+            .qpn_index
+            .get(config.local_qpn)
+            .is_some_and(|owner| owner != handle.slot())
         {
             return Err(ApiError::DuplicateLocalQpn(config.local_qpn));
         }
 
         let slot = self.qps[handle_index]
+            .as_ref()
+            .ok_or(ApiError::InvalidQpHandle)?;
+        let previous_qpn = slot.machine.config().local_qpn;
+        let mut machine = slot.machine;
+        machine.reconfigure(config)?;
+
+        if previous_qpn != config.local_qpn {
+            insert_qpn(&mut self.qpn_index, config.local_qpn, handle_index)?;
+            let removed = self.qpn_index.remove(previous_qpn);
+            debug_assert_eq!(removed, Some(handle.slot()));
+        }
+
+        let slot = self.qps[handle_index]
             .as_mut()
             .ok_or(ApiError::InvalidQpHandle)?;
-        slot.machine.reconfigure(config)?;
+        slot.machine = machine;
         slot.send_window.reset(config.send_psn);
         slot.receive_psn.reset(config.receive_psn);
         Ok(())
@@ -346,15 +362,15 @@ where
         let destination_qpn = decoded.transport.bth.destination_qpn;
         let opcode = decoded.transport.bth.opcode;
         let bytes = usize::from(decoded.ipv4.total_length);
-        let Some(slot) = self
-            .qps
-            .iter()
-            .flatten()
-            .find(|slot| slot.machine.config().local_qpn == destination_qpn)
-        else {
+        let Some(index) = qpn_slot(&self.qpn_index, destination_qpn) else {
             self.stats.unknown_qp_packets = self.stats.unknown_qp_packets.saturating_add(1);
             return Err(ApiError::UnknownDestinationQpn(destination_qpn).into());
         };
+        let slot = self
+            .qps
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or(ApiError::UnknownDestinationQpn(destination_qpn))?;
         if !slot.machine.can_receive() {
             let state = slot.machine.state();
             self.stats.qp_not_ready_packets = self.stats.qp_not_ready_packets.saturating_add(1);
@@ -412,7 +428,7 @@ mod tests {
         }
     }
 
-    fn endpoint() -> Endpoint<MockIo, 2> {
+    fn endpoint() -> Endpoint<MockIo, 2, 4> {
         Endpoint::new(
             MockIo::new(1500),
             EndpointConfig {
@@ -420,6 +436,85 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn rejects_underprovisioned_or_non_power_of_two_qpn_index() {
+        let underprovisioned = Endpoint::<MockIo, 3, 4>::new(
+            MockIo::new(1500),
+            EndpointConfig {
+                maximum_packet_size: 1500,
+            },
+        );
+        assert!(matches!(
+            underprovisioned,
+            Err(ApiError::InvalidQpnIndexCapacity {
+                qp_capacity: 3,
+                index_capacity: 4,
+            })
+        ));
+
+        let non_power_of_two = Endpoint::<MockIo, 2, 6>::new(
+            MockIo::new(1500),
+            EndpointConfig {
+                maximum_packet_size: 1500,
+            },
+        );
+        assert!(matches!(
+            non_power_of_two,
+            Err(ApiError::InvalidQpnIndexCapacity {
+                qp_capacity: 2,
+                index_capacity: 6,
+            })
+        ));
+    }
+
+    #[test]
+    fn qpn_index_tracks_collision_removal_and_reconfiguration() {
+        let mut endpoint = endpoint();
+        let first = endpoint.create_qp(qp_config(2)).unwrap();
+        let second = endpoint.create_qp(qp_config(3)).unwrap();
+        endpoint.remove_qp(first).unwrap();
+
+        endpoint.reconfigure_qp(second, qp_config(10)).unwrap();
+        endpoint.transition_qp(second, QpState::Init).unwrap();
+        endpoint.transition_qp(second, QpState::Rtr).unwrap();
+
+        let path = Ipv4Path::new([192, 0, 2, 1], [192, 0, 2, 2], 49_152);
+        let mut scratch = [0_u8; 1500];
+        let old_packet = PacketSpec {
+            bth: Bth::new(Opcode::SendOnly, 3, 7),
+            reth: None,
+            aeth: None,
+            immediate_data: None,
+            payload: b"old",
+        };
+        endpoint.transmit(path, old_packet, &mut scratch).unwrap();
+        let frame = endpoint.io_mut().pop_transmitted().unwrap();
+        endpoint.io_mut().inject_receive(frame.as_bytes()).unwrap();
+        assert!(matches!(
+            endpoint.poll_receive(&mut scratch),
+            Err(PollError::Api(ApiError::UnknownDestinationQpn(3)))
+        ));
+
+        let new_packet = PacketSpec {
+            bth: Bth::new(Opcode::SendOnly, 10, 7),
+            reth: None,
+            aeth: None,
+            immediate_data: None,
+            payload: b"new",
+        };
+        endpoint.transmit(path, new_packet, &mut scratch).unwrap();
+        let frame = endpoint.io_mut().pop_transmitted().unwrap();
+        endpoint.io_mut().inject_receive(frame.as_bytes()).unwrap();
+        assert!(matches!(
+            endpoint.poll_receive(&mut scratch).unwrap(),
+            PollProgress::Packet {
+                destination_qpn: 10,
+                opcode: Opcode::SendOnly,
+                ..
+            }
+        ));
     }
 
     #[test]

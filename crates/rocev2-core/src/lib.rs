@@ -10,6 +10,7 @@
 mod ack;
 mod psn;
 mod qp;
+mod qpn;
 mod retry;
 mod ring;
 mod segment;
@@ -18,6 +19,7 @@ mod work;
 pub use ack::{AckAdvance, MAX_OUTSTANDING_PACKETS, ReceiveDisposition, ReceivePsn, SendWindow};
 pub use psn::{PSN_MASK, PSN_MODULUS, Psn, PsnOrdering};
 pub use qp::{PathMtu, QpConfig, QpState, QpStateMachine, StateTransitionError};
+pub use qpn::{MAX_QPN, QpnInsertError, QpnTable};
 pub use retry::{
     RetryBudget, RetryDecision, RetryPolicy, RetryReason, Timer, ack_timeout_ticks,
     rnr_timer_microseconds, rnr_timer_ticks,

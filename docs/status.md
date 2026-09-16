@@ -17,6 +17,8 @@ must not be claimed before qualification runs exist.
   raw-IPv4 correctness backend.
 - Fixed-capacity posted SEND, RDMA WRITE, and RDMA READ execution with one SGE
   per WQE and CQ generation for requester and receive work.
+- Fixed-capacity open-addressed local-QPN routing with collision-safe deletion,
+  bounded load factor, and no per-packet scan across the QP table.
 - MTU segmentation/reassembly, positive ACKs, sequence/access/invalid-request
   NAKs, RNR NAKs, timeout and NAK retry scheduling, duplicate suppression, and
   RDMA READ response replay.

@@ -9,7 +9,7 @@ use rocev2::{
     decode_ipv4_packet, encode_ipv4_packet,
 };
 
-type TestEndpoint<'a> = RcEndpoint<'a, MockIo, 2, 8, 8, 8, 16>;
+type TestEndpoint<'a> = RcEndpoint<'a, MockIo, 2, 8, 8, 8, 16, 4>;
 
 fn endpoint<'a>() -> TestEndpoint<'a> {
     RcEndpoint::new(
@@ -51,6 +51,74 @@ fn ready(endpoint: &mut TestEndpoint<'_>, handle: QpHandle) {
     endpoint.transition_qp(handle, QpState::Init).unwrap();
     endpoint.transition_qp(handle, QpState::Rtr).unwrap();
     endpoint.transition_qp(handle, QpState::Rts).unwrap();
+}
+
+#[test]
+fn rc_qpn_index_tracks_collision_removal_and_reconfiguration() {
+    let mut endpoint = endpoint();
+    let first = endpoint
+        .create_qp(qp_config(2, 20, 10, 30, [192, 0, 2, 1], [192, 0, 2, 20]))
+        .unwrap();
+    let second = endpoint
+        .create_qp(qp_config(3, 30, 20, 40, [192, 0, 2, 1], [192, 0, 2, 30]))
+        .unwrap();
+    endpoint.remove_qp(first).unwrap();
+    endpoint
+        .reconfigure_qp(
+            second,
+            qp_config(10, 30, 20, 40, [192, 0, 2, 1], [192, 0, 2, 30]),
+        )
+        .unwrap();
+    endpoint.transition_qp(second, QpState::Init).unwrap();
+    endpoint.transition_qp(second, QpState::Rtr).unwrap();
+
+    let peer_path = Ipv4Path::new([192, 0, 2, 30], [192, 0, 2, 1], 49_152);
+    let mut packet = [0_u8; 512];
+    let mut receive = [0_u8; 512];
+    let mut transmit = [0_u8; 512];
+
+    let old_length = encode_ipv4_packet(
+        peer_path,
+        PacketSpec {
+            bth: Bth::new(Opcode::SendOnly, 3, 40),
+            reth: None,
+            aeth: None,
+            immediate_data: None,
+            payload: b"old",
+        },
+        &mut packet,
+    )
+    .unwrap();
+    endpoint
+        .io_mut()
+        .inject_receive(&packet[..old_length])
+        .unwrap();
+    assert!(matches!(
+        endpoint.progress(0, &mut receive, &mut transmit),
+        Err(rocev2::PollError::Api(
+            rocev2::ApiError::UnknownDestinationQpn(3)
+        ))
+    ));
+
+    let new_length = encode_ipv4_packet(
+        peer_path,
+        PacketSpec {
+            bth: Bth::new(Opcode::SendOnly, 10, 40),
+            reth: None,
+            aeth: None,
+            immediate_data: None,
+            payload: b"new",
+        },
+        &mut packet,
+    )
+    .unwrap();
+    endpoint
+        .io_mut()
+        .inject_receive(&packet[..new_length])
+        .unwrap();
+    let progress = endpoint.progress(1, &mut receive, &mut transmit).unwrap();
+    assert_eq!(progress.received_packets, 1);
+    assert_eq!(progress.transmitted_packets, 1);
 }
 
 fn read_replay_qps(requester: &mut TestEndpoint<'_>, responder: &mut TestEndpoint<'_>) -> QpHandle {

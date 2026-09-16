@@ -17,7 +17,7 @@ Linux RXE.
 | Crate | Purpose |
 |---|---|
 | `rocev2-wire` | `no_std`, allocation-free BTH/RETH/AETH, IPv4/UDP, and ICRC |
-| `rocev2-core` | `no_std` PSN, QP, retry, segmentation, and fixed-ring primitives |
+| `rocev2-core` | `no_std` PSN, QP, retry, segmentation, fixed-ring, and QPN-index primitives |
 | `rocev2-memory` | generation-tagged lkey/rkey registration and checked access |
 | `rocev2-io` | backend-neutral packet I/O, deterministic mock I/O, and raw IPv4 |
 | `rocev2` | endpoint composition and fixed-capacity RC posted-work engine |
@@ -28,11 +28,17 @@ band; RDMA-CM is not part of the current implementation.
 
 ## Posted-work engine
 
-`RcEndpoint` owns a fixed QP table, fixed SQ/RQ/CQ rings, a checked memory
-registry, and one packet of scratch space. QPs and their rings allocate only on
-the control path. Once the endpoint, QPs, and MRs exist, posting, polling,
-packet parsing/encoding, ACK processing, memory copies, and retries do not
-perform transport-owned heap allocations.
+`RcEndpoint` owns a fixed QP table, an open-addressed local-QPN index, fixed
+SQ/RQ/CQ rings, a checked memory registry, and one packet of scratch space.
+Incoming packets use the QPN index instead of scanning every live QP. QPs and
+their rings allocate only on the control path. Once the endpoint, QPs, and MRs
+exist, posting, polling, packet parsing/encoding, ACK processing, memory copies,
+and retries do not perform transport-owned heap allocations.
+
+The default endpoint reserves 2,048 QPN-index entries for 1,024 QP slots. A
+custom `QPN_INDEX` capacity must be a power of two and at least twice `QPS`,
+keeping the table at or below 50 percent load while QPs are created, removed,
+and reconfigured.
 
 ```rust,no_run
 use std::net::Ipv4Addr;

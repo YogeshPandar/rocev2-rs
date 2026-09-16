@@ -196,7 +196,7 @@ impl Timer {
 
 /// Convert the five-bit RC local ACK timeout code to caller timer ticks.
 ///
-/// InfiniBand defines the timeout as `4.096 microseconds * 2^code`. The
+/// `InfiniBand` defines the timeout as `4.096 microseconds * 2^code`. The
 /// conversion rounds up so a configured timeout is never shortened.
 #[must_use]
 pub fn ack_timeout_ticks(code: u8, ticks_per_second: u64) -> Option<u64> {

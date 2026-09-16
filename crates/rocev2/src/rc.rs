@@ -5,13 +5,14 @@
 //! endpoint and QP construction; posting, polling, parsing, memory access,
 //! completion, ACK/NAK generation, and retransmission use fixed-capacity state.
 
+use crate::qp::{insert_qpn, qpn_slot, validate_qpn_index};
 use crate::{
     ApiError, DecodedPacket, Ipv4Path, MIN_ROCE_IPV4_PACKET, PollError, QpHandle, QueueKind,
     decode_ipv4_packet, encode_ipv4_packet,
 };
 use rocev2_core::{
     AckAdvance, Completion, CompletionOpcode, CompletionStatus, MAX_OUTSTANDING_PACKETS, Psn,
-    QpConfig, QpState, QpStateMachine, ReceiveDisposition, ReceivePsn, RecvWorkRequest,
+    QpConfig, QpState, QpStateMachine, QpnTable, ReceiveDisposition, ReceivePsn, RecvWorkRequest,
     RetryBudget, RetryDecision, RetryPolicy, RetryReason, Ring, SendWindow, Timer, WorkRequest,
     WorkRequestKind, ack_timeout_ticks, rnr_timer_ticks,
 };
@@ -391,6 +392,9 @@ struct HandlerResult {
 /// Once QPs and memory are registered, [`Self::progress`], posting, completion
 /// polling, ACK/NAK handling, and retransmission perform no transport-owned
 /// heap allocation.
+///
+/// `QPN_INDEX` must be a power of two and at least twice `QPS`. The default
+/// keeps the fixed open-addressed QPN table at or below 50 percent load.
 pub struct RcEndpoint<
     'memory,
     Io,
@@ -399,6 +403,7 @@ pub struct RcEndpoint<
     const SQ: usize = 128,
     const RQ: usize = 128,
     const CQ: usize = 256,
+    const QPN_INDEX: usize = 2048,
 > {
     io: Io,
     config: RcEndpointConfig,
@@ -406,6 +411,7 @@ pub struct RcEndpoint<
     memory: Box<MemoryRegistry<'memory, MRS>>,
     qps: [Option<Box<RcQpSlot<SQ, RQ, CQ>>>; QPS],
     generations: [u32; QPS],
+    qpn_index: Box<QpnTable<QPN_INDEX>>,
     payload_scratch: [u8; MAX_MTU_BYTES],
     transmit_cursor: usize,
 }
@@ -418,7 +424,8 @@ impl<
     const SQ: usize,
     const RQ: usize,
     const CQ: usize,
-> RcEndpoint<'memory, Io, QPS, MRS, SQ, RQ, CQ>
+    const QPN_INDEX: usize,
+> RcEndpoint<'memory, Io, QPS, MRS, SQ, RQ, CQ, QPN_INDEX>
 where
     Io: PacketIo,
 {
@@ -439,6 +446,7 @@ where
         if config.ticks_per_second == 0 {
             return Err(ApiError::InvalidTicksPerSecond);
         }
+        validate_qpn_index::<QPS, QPN_INDEX>()?;
 
         Ok(Self {
             io,
@@ -447,6 +455,7 @@ where
             memory: Box::new(MemoryRegistry::new(config.memory_key_seed)?),
             qps: core::array::from_fn(|_| None),
             generations: [0; QPS],
+            qpn_index: Box::new(QpnTable::new()),
             payload_scratch: [0; MAX_MTU_BYTES],
             transmit_cursor: 0,
         })
@@ -517,12 +526,7 @@ where
         if config.rnr_nak_timer > MAX_RNR_TIMER {
             return Err(ApiError::InvalidRnrNakTimer(config.rnr_nak_timer));
         }
-        if self
-            .qps
-            .iter()
-            .flatten()
-            .any(|slot| slot.machine.config().local_qpn == config.transport.local_qpn)
-        {
+        if self.qpn_index.get(config.transport.local_qpn).is_some() {
             return Err(ApiError::DuplicateLocalQpn(config.transport.local_qpn));
         }
 
@@ -541,10 +545,10 @@ where
             .ok_or(ApiError::QpTableFull)?;
         let generation = self.generations[index].wrapping_add(1).max(1);
         let slot = RcQpSlot::new(generation, config)?;
+        let slot_number = insert_qpn(&mut self.qpn_index, config.transport.local_qpn, index)?;
         self.generations[index] = generation;
         self.qps[index] = Some(Box::new(slot));
 
-        let slot_number = u32::try_from(index).map_err(|_| ApiError::QpTableFull)?;
         Ok(QpHandle::new(slot_number, generation))
     }
 
@@ -556,7 +560,10 @@ where
             return Err(ApiError::QpBusy);
         }
         let slot = self.qps[index].take().ok_or(ApiError::InvalidQpHandle)?;
-        Ok(slot.config())
+        let config = slot.config();
+        let removed = self.qpn_index.remove(config.transport.local_qpn);
+        debug_assert_eq!(removed, Some(handle.slot()));
+        Ok(config)
     }
 
     /// Return the current QP state.
@@ -584,21 +591,29 @@ where
 
         let index = self.qp_index(handle)?;
         if self
-            .qps
-            .iter()
-            .enumerate()
-            .filter(|(candidate, _)| *candidate != index)
-            .filter_map(|(_, slot)| slot.as_ref())
-            .any(|slot| slot.machine.config().local_qpn == config.transport.local_qpn)
+            .qpn_index
+            .get(config.transport.local_qpn)
+            .is_some_and(|owner| owner != handle.slot())
         {
             return Err(ApiError::DuplicateLocalQpn(config.transport.local_qpn));
         }
 
-        let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
+        let slot = self.qps[index].as_ref().ok_or(ApiError::InvalidQpHandle)?;
         if slot.is_busy() {
             return Err(ApiError::QpBusy);
         }
-        slot.machine.reconfigure(config.transport)?;
+        let previous_qpn = slot.machine.config().local_qpn;
+        let mut machine = slot.machine;
+        machine.reconfigure(config.transport)?;
+
+        if previous_qpn != config.transport.local_qpn {
+            insert_qpn(&mut self.qpn_index, config.transport.local_qpn, index)?;
+            let removed = self.qpn_index.remove(previous_qpn);
+            debug_assert_eq!(removed, Some(handle.slot()));
+        }
+
+        let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
+        slot.machine = machine;
         slot.path = config.path;
         slot.rnr_nak_timer = config.rnr_nak_timer;
         slot.reset_transport_state();
@@ -841,17 +856,17 @@ where
         decoded: DecodedPacket<'_>,
     ) -> Result<HandlerResult, ApiError> {
         let destination_qpn = decoded.transport.bth.destination_qpn;
-        let Some(index) = self.qps.iter().position(|candidate| {
-            candidate
-                .as_ref()
-                .is_some_and(|slot| slot.machine.config().local_qpn == destination_qpn)
-        }) else {
+        let Some(index) = qpn_slot(&self.qpn_index, destination_qpn) else {
             self.stats.unknown_qp_packets = self.stats.unknown_qp_packets.saturating_add(1);
             return Err(ApiError::UnknownDestinationQpn(destination_qpn));
         };
 
         let peer_matches = {
-            let slot = self.qps[index].as_ref().ok_or(ApiError::InvalidQpHandle)?;
+            let slot = self
+                .qps
+                .get(index)
+                .and_then(Option::as_ref)
+                .ok_or(ApiError::InvalidQpHandle)?;
             decoded.ipv4.source == slot.path.destination
                 && decoded.ipv4.destination == slot.path.source
         };
@@ -863,7 +878,11 @@ where
             });
         }
 
-        let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
+        let slot = self
+            .qps
+            .get_mut(index)
+            .and_then(Option::as_mut)
+            .ok_or(ApiError::InvalidQpHandle)?;
         if !slot.machine.can_receive() {
             return Err(ApiError::QpNotReady(slot.machine.state()));
         }
