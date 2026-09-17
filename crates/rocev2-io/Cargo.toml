@@ -1,6 +1,6 @@
 [package]
 name = "rocev2-io"
-description = "Packet I/O backends for rocev2-rs, including Linux raw IPv4 reference I/O"
+description = "Packet I/O backends for rocev2-rs, including Linux raw IPv4 and AF_XDP"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

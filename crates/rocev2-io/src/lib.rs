@@ -1,11 +1,15 @@
 //! packet i/o abstractions for the `RoCEv2` data plane.
 //!
 //! the scalar trait exchanges complete ipv4 packets in caller-owned buffers.
-//! the batch trait adds explicit receive and transmit frame ownership so a
-//! future `AF_XDP` backend can expose UMEM frames without transport copies.
+//! the batch trait adds explicit receive and transmit frame ownership so
+//! `AF_XDP` can expose UMEM frames without transport copies.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[allow(unsafe_code)]
+#[cfg(all(feature = "afxdp", target_os = "linux"))]
+mod afxdp;
+mod ethernet;
 mod fixed;
 mod mock;
 
@@ -13,6 +17,12 @@ mod mock;
 #[cfg(all(feature = "raw-ipv4", target_os = "linux"))]
 mod raw_ipv4;
 
+#[cfg(all(feature = "afxdp", target_os = "linux"))]
+pub use afxdp::{
+    AfxdpBindMode, AfxdpConfig, AfxdpError, AfxdpKernelStatistics, AfxdpRxFrame, AfxdpSocket,
+    AfxdpStatistics, AfxdpTxFrame, UmemBacking,
+};
+pub use ethernet::{ETHERNET_HEADER_LEN, EthernetPath};
 pub use fixed::{FixedFrame, FixedPacketIo, FixedPacketIoError, FixedRxFrame, FixedTxFrame};
 pub use mock::{Frame, MockIo, MockIoError};
 #[cfg(all(feature = "raw-ipv4", target_os = "linux"))]

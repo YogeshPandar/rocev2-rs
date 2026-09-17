@@ -8,9 +8,9 @@ Linux RXE.
 > **Status: pre-1.0 engineering preview.** A fixed-capacity RC execution engine
 > now posts and executes SEND, WRITE, and READ in deterministic software tests,
 > including completions, segmentation, ACK/NAK/RNR, duplicate suppression, and
-> retry scheduling. Linux RXE and hardware-RNIC interoperability, production
-> AF_XDP, sustained fuzzing, and performance qualification are still release
-> blockers. Do not expose untrusted memory or production traffic yet.
+> retry scheduling. The AF_XDP UMEM/ring/socket foundation is implemented, while
+> XDP steering, Linux RXE and hardware-RNIC interoperability, sustained fuzzing,
+> and performance qualification are still release blockers. Do not expose untrusted memory or production traffic yet.
 
 ## Workspace
 
@@ -19,7 +19,7 @@ Linux RXE.
 | `rocev2-wire` | `no_std`, allocation-free BTH/RETH/AETH, IPv4/UDP, and ICRC |
 | `rocev2-core` | `no_std` PSN, QP, retry, segmentation, fixed-ring, QPN-index, and active-QP scheduling primitives |
 | `rocev2-memory` | generation-tagged lkey/rkey registration and checked access |
-| `rocev2-io` | backend-neutral packet I/O, deterministic mock I/O, and raw IPv4 |
+| `rocev2-io` | backend-neutral packet I/O, deterministic mock I/O, raw IPv4, and the AF_XDP foundation |
 | `rocev2` | endpoint composition and fixed-capacity RC posted-work engine |
 
 The current scope is deliberately narrow: RoCEv2 over IPv4, RC QPs, one SGE
@@ -145,8 +145,9 @@ produce a sequence NAK. RDMA READ reserves the complete response PSN span before
 the request is transmitted.
 
 See [implementation status](docs/status.md), [architecture](docs/architecture.md),
-and [protocol sources](docs/protocol-sources.md) for the current qualification
-boundary and the primary references used by the implementation.
+[AF_XDP backend](docs/afxdp.md), and [protocol sources](docs/protocol-sources.md)
+for the current qualification boundary and the primary references used by the
+implementation.
 
 ## Validation
 
