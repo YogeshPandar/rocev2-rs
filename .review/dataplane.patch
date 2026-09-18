@@ -1,0 +1,11 @@
+diff --git a/crates/rocev2/src/rc.rs b/crates/rocev2/src/rc.rs
+--- a/crates/rocev2/src/rc.rs
++++ b/crates/rocev2/src/rc.rs
+@@ -3333,6 +3333,7 @@
+         if !matches!(aeth.class(), AethClass::Ack { .. }) {
+             return handle_aeth_response(
+                 slot,
++                memory,
+                 aeth,
+                 Psn::new_truncated(packet.bth.psn),
+                 now,
