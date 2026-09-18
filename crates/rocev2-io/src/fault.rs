@@ -114,9 +114,9 @@ impl FaultRule {
         let Some(identity) = identity else {
             return false;
         };
-        !self.opcode.is_some_and(|value| value != identity.opcode)
-            && !self.qpn.is_some_and(|value| value != identity.qpn)
-            && !self.psn.is_some_and(|value| value != identity.psn)
+        self.opcode.is_none_or(|value| value == identity.opcode)
+            && self.qpn.is_none_or(|value| value == identity.qpn)
+            && self.psn.is_none_or(|value| value == identity.psn)
     }
 }
 
@@ -456,34 +456,30 @@ where
 
     fn receive_ipv4(&mut self, output: &mut [u8]) -> Result<Option<usize>, Self::Error> {
         if self.rx_reorder_waiting {
-            match self
+            if let Some(length) = self
                 .inner
                 .receive_ipv4(&mut self.rx_scratch)
                 .map_err(FaultInjectError::Inner)?
             {
-                Some(length) => {
-                    self.rx_packet_number = self.rx_packet_number.saturating_add(1);
-                    if length > MAX_PACKET {
-                        return Err(FaultInjectError::PacketTooLarge {
-                            length,
-                            maximum: MAX_PACKET,
-                        });
-                    }
-                    if output.len() < length {
-                        return Err(FaultInjectError::OutputTooSmall {
-                            required: length,
-                            available: output.len(),
-                        });
-                    }
-                    output[..length].copy_from_slice(&self.rx_scratch[..length]);
-                    self.rx_reorder_waiting = false;
-                    return Ok(Some(length));
+                self.rx_packet_number = self.rx_packet_number.saturating_add(1);
+                if length > MAX_PACKET {
+                    return Err(FaultInjectError::PacketTooLarge {
+                        length,
+                        maximum: MAX_PACKET,
+                    });
                 }
-                None => {
-                    self.rx_reorder_waiting = false;
-                    return self.rx_held.copy_to(output).map(Some);
+                if output.len() < length {
+                    return Err(FaultInjectError::OutputTooSmall {
+                        required: length,
+                        available: output.len(),
+                    });
                 }
+                output[..length].copy_from_slice(&self.rx_scratch[..length]);
+                self.rx_reorder_waiting = false;
+                return Ok(Some(length));
             }
+            self.rx_reorder_waiting = false;
+            return self.rx_held.copy_to(output).map(Some);
         }
 
         if self.rx_held.ready {
