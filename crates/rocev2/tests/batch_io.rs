@@ -2,11 +2,11 @@
 
 use rocev2::io::FixedPacketIo;
 use rocev2::memory::AccessFlags;
-use rocev2::wire::{Bth, Opcode, PacketSpec};
+use rocev2::wire::{Bth, Opcode, PacketSpec, Reth};
 use rocev2::{
     Completion, CompletionOpcode, CompletionStatus, Ipv4Path, PathMtu, Psn, QpConfig, QpState,
-    RcEndpoint, RcEndpointConfig, RcQpConfig, RecvWorkRequest, Sge, decode_ipv4_packet,
-    encode_ipv4_packet,
+    RcEndpoint, RcEndpointConfig, RcQpConfig, RecvWorkRequest, Sge, WorkRequest,
+    decode_ipv4_packet, encode_ipv4_packet,
 };
 
 type BatchEndpoint<'a> = RcEndpoint<'a, FixedPacketIo<8, 8, 512>, 2, 8, 8, 8, 16, 4>;
@@ -107,6 +107,79 @@ fn progress_batch_processes_receive_and_control_bursts() {
         let decoded = decode_ipv4_packet(frame.as_bytes()).unwrap();
         assert_eq!(decoded.transport.bth.opcode, Opcode::Acknowledge);
     }
+}
+
+#[test]
+fn progress_batch_encodes_requester_payload_from_registered_memory() {
+    let mut endpoint = endpoint();
+    let mut source = *b"batch-send-payload";
+    let mr = endpoint
+        .register_memory(&mut source, AccessFlags::NONE)
+        .unwrap();
+    let qp = endpoint.create_qp(config()).unwrap();
+    ready(&mut endpoint, qp);
+    endpoint
+        .post_work(
+            qp,
+            WorkRequest::send(
+                7,
+                Sge::new(mr.address(), u32::try_from(source.len()).unwrap(), mr.lkey()),
+                true,
+            ),
+        )
+        .unwrap();
+
+    let progress = endpoint.progress_batch(0, 8).unwrap();
+    assert_eq!(progress.transmitted_packets, 1);
+    let frame = endpoint.io_mut().pop_transmitted().unwrap();
+    let decoded = decode_ipv4_packet(frame.as_bytes()).unwrap();
+    assert_eq!(decoded.transport.bth.opcode, Opcode::SendOnly);
+    assert_eq!(decoded.transport.bth.destination_qpn, 20);
+    assert_eq!(decoded.transport.bth.psn, 10);
+    assert_eq!(decoded.transport.payload, b"batch-send-payload");
+}
+
+#[test]
+fn progress_batch_encodes_read_response_from_registered_memory() {
+    let mut endpoint = endpoint();
+    let mut source = *b"read-data";
+    let mr = endpoint
+        .register_memory(&mut source, AccessFlags::REMOTE_READ)
+        .unwrap();
+    let qp = endpoint.create_qp(config()).unwrap();
+    ready(&mut endpoint, qp);
+
+    let mut packet = [0_u8; 512];
+    let request_length = encode_ipv4_packet(
+        Ipv4Path::new([192, 0, 2, 20], [192, 0, 2, 1], 49_152),
+        PacketSpec {
+            bth: Bth::new(Opcode::RdmaReadRequest, 2, 30),
+            reth: Some(Reth {
+                virtual_address: mr.address(),
+                remote_key: mr.rkey(),
+                dma_length: u32::try_from(source.len()).unwrap(),
+            }),
+            aeth: None,
+            immediate_data: None,
+            payload: &[],
+        },
+        &mut packet,
+    )
+    .unwrap();
+    endpoint
+        .io_mut()
+        .inject_receive(&packet[..request_length])
+        .unwrap();
+
+    let progress = endpoint.progress_batch(0, 8).unwrap();
+    assert_eq!(progress.received_packets, 1);
+    assert_eq!(progress.transmitted_packets, 1);
+    let frame = endpoint.io_mut().pop_transmitted().unwrap();
+    let decoded = decode_ipv4_packet(frame.as_bytes()).unwrap();
+    assert_eq!(decoded.transport.bth.opcode, Opcode::RdmaReadResponseOnly);
+    assert_eq!(decoded.transport.bth.destination_qpn, 20);
+    assert_eq!(decoded.transport.bth.psn, 30);
+    assert_eq!(decoded.transport.payload, b"read-data");
 }
 
 #[test]
