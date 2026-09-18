@@ -15,7 +15,9 @@ This phase implements:
 - explicit zero-copy, copy, or opt-in fallback bind policy;
 - untagged Ethernet II encapsulation for IPv4;
 - direct borrowed IPv4 parsing from UMEM on RX;
-- allocation-free batch receive, transmit, recycle, and completion processing after construction.
+- allocation-free batch receive, transmit, recycle, and completion processing after construction;
+- native XDP BPF-link ownership and XSKMAP queue registration;
+- deterministic completion validation before TX frames return to the free pool.
 
 The backend uses the AF_XDP structures and constants exported by the pinned `libc` crate. It does not duplicate Linux UAPI layouts in project code.
 
@@ -32,7 +34,9 @@ let ethernet = EthernetPath::new(
     [0x02, 0x00, 0x00, 0x00, 0x00, 0x02],
 );
 let config = AfxdpConfig::new(2, 0, ethernet);
-let socket = AfxdpSocket::bind(config)?;
+let steering = rocev2::io::XdpSteering::attach(2, 1)?;
+let mut socket = AfxdpSocket::bind(config)?;
+socket.attach_steering(&steering)?;
 assert!(socket.max_ipv4_packet() >= 1500);
 # Ok(())
 # }
@@ -44,9 +48,11 @@ AF_XDP UMEM is pinned by the kernel during registration. The process therefore n
 
 ## XDP steering requirement
 
-`AfxdpSocket` does not install an XDP program and does not manage an XSKMAP in this phase. A compatible XDP program must redirect the target queue to the socket before traffic can arrive. XDP steering and XSKMAP lifecycle are the next production phase.
+`XdpSteering::attach(interface_index, queue_count)` creates the project-owned XSKMAP, loads the minimal steering program, and owns the native XDP BPF link. `AfxdpSocket::attach_steering` registers the socket at its configured queue index. Registration uses non-replacing insertion, so an already occupied queue is never silently stolen.
 
-The transport logic remains outside the XDP program. Steering should only identify eligible RoCEv2 UDP traffic and redirect it to the correct queue/socket.
+The program redirects only untagged, unfragmented IPv4 packets without IP options whose UDP destination port is 4791. Packets outside that narrow shape, and eligible packets arriving on queues without a registered socket, pass to the normal network stack. The XDP program performs steering only; RC transport logic remains in userspace.
+
+The native BPF-link attach path does not replace an existing XDP owner. Dropping or explicitly detaching a socket removes its XSKMAP entry before the socket descriptor is closed. The steering object retains the map, program, and link descriptors for the attachment lifetime.
 
 ## Frame ownership
 
@@ -99,7 +105,7 @@ Each AF_XDP ring has one userspace owner. The implementation follows the kernel 
 
 After bind, `AfxdpSocket::is_zero_copy()` reports the mode returned by `XDP_OPTIONS`.
 
-This only describes packet ownership between the NIC/kernel and UMEM. Registered application memory used by RC SEND, WRITE, or READ is still copied into or out of UMEM by the current transport. UMEM-backed application buffers belong to the later XDP production phase and must be documented separately before the project claims payload zero-copy.
+This only describes packet ownership between the NIC/kernel and UMEM. On the batched transmit path, checked registered-memory payloads are borrowed directly and encoded into the final UMEM TX frame, so there is no intermediate MTU payload copy. The payload is still copied once from arbitrary registered memory into UMEM. UMEM-backed application buffers remain future work and are required before arbitrary RC payloads can be described as payload zero-copy.
 
 ## Current limits
 
@@ -110,7 +116,6 @@ Other current limits are:
 - no VLAN or QinQ support;
 - no shared UMEM across sockets;
 - no multi-buffer RX/TX descriptors;
-- no XDP program or XSKMAP management;
 - no UMEM-backed application buffer API;
 - no hardware or RXE AF_XDP qualification yet.
 
