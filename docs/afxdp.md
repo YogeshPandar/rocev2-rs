@@ -116,10 +116,18 @@ Other current limits are:
 - no VLAN or QinQ support;
 - no shared UMEM across sockets;
 - no multi-buffer RX/TX descriptors;
-- no UMEM-backed application buffer API;
-- no hardware or RXE AF_XDP qualification yet.
+- no UMEM-backed application buffer API.
 
-These are deliberate phase boundaries, not implied support.
+These are deliberate initial-release limits, not implied support. Linux AF_XDP
+shared-UMEM ownership and multi-buffer `XDP_USE_SG` semantics require different
+ring/frame ownership rules and are intentionally not emulated by the single-frame
+backend.
+
+The interoperability Rust peer can instantiate the AF_XDP backend for privileged
+hardware qualification. Harness presence does not constitute hardware
+qualification; zero-copy mode, verifier/attach behavior, queue steering, and
+SEND/WRITE/READ interoperability must still be demonstrated on each supported
+NIC/driver combination.
 
 ## References
 
