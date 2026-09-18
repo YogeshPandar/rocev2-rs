@@ -157,7 +157,7 @@ fn progress_batch_encodes_read_response_from_registered_memory() {
             reth: Some(Reth {
                 virtual_address: mr.address(),
                 remote_key: mr.rkey(),
-                dma_length: u32::try_from(source.len()).unwrap(),
+                dma_length: u32::try_from(mr.length()).unwrap(),
             }),
             aeth: None,
             immediate_data: None,
