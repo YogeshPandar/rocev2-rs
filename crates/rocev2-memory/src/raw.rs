@@ -16,6 +16,21 @@ pub(crate) unsafe fn slice_from_raw_parts_mut<'a>(
     unsafe { core::slice::from_raw_parts_mut(pointer.as_ptr(), length) }
 }
 
+/// Borrow a checked registered range without copying.
+///
+/// # Safety
+///
+/// `pointer.add(offset)..+length` must be readable inside one live allocation.
+/// the returned lifetime must not outlive the registry borrow that prevents mutation.
+pub(crate) unsafe fn slice_from_registered<'a>(
+    pointer: NonNull<u8>,
+    offset: usize,
+    length: usize,
+) -> &'a [u8] {
+    // SAFETY: guaranteed by the caller contract after range validation.
+    unsafe { core::slice::from_raw_parts(pointer.as_ptr().add(offset), length) }
+}
+
 /// Copy from a checked registered range.
 ///
 /// # Safety
