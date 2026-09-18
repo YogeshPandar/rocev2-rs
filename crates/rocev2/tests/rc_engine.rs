@@ -1,8 +1,6 @@
 //! Black-box RC endpoint execution and reliability tests.
 
-use rocev2::io::{
-    FaultAction, FaultDirection, FaultInjectIo, FaultRule, Frame, MockIo, PacketIo,
-};
+use rocev2::io::{FaultAction, FaultDirection, FaultInjectIo, FaultRule, Frame, MockIo, PacketIo};
 use rocev2::memory::AccessFlags;
 use rocev2::wire::{Aeth, AethClass, Bth, Opcode, PacketSpec, Reth};
 use rocev2::{
@@ -722,7 +720,9 @@ fn fault_injector_drop_drives_real_timeout_retransmission() {
     let responder_qp = responder
         .create_qp(qp_config(3, 2, 50, 5, [10, 4, 0, 2], [10, 4, 0, 1]))
         .unwrap();
-    requester.transition_qp(requester_qp, QpState::Init).unwrap();
+    requester
+        .transition_qp(requester_qp, QpState::Init)
+        .unwrap();
     requester.transition_qp(requester_qp, QpState::Rtr).unwrap();
     requester.transition_qp(requester_qp, QpState::Rts).unwrap();
     ready(&mut responder, responder_qp);
@@ -763,10 +763,7 @@ fn fault_injector_drop_drives_real_timeout_retransmission() {
         .inner_mut()
         .pop_transmitted()
         .expect("timeout retransmission");
-    responder
-        .io_mut()
-        .inject_receive(retry.as_bytes())
-        .unwrap();
+    responder.io_mut().inject_receive(retry.as_bytes()).unwrap();
     responder.progress(5, &mut rx, &mut tx).unwrap();
     let ack = responder.io_mut().pop_transmitted().expect("send ack");
     requester
