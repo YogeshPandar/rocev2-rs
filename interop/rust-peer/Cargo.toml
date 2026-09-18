@@ -6,7 +6,7 @@ rust-version = "1.85"
 publish = false
 
 [dependencies]
-rocev2 = { path = "../../crates/rocev2", default-features = false, features = ["std", "raw-ipv4"] }
+rocev2 = { path = "../../crates/rocev2", default-features = false, features = ["std", "raw-ipv4", "afxdp"] }
 
 [workspace]
 
