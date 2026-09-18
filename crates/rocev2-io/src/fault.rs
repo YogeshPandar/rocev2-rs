@@ -501,7 +501,6 @@ where
         self.rx_packet_number = self.rx_packet_number.saturating_add(1);
         let identity = packet_identity(&self.rx_scratch[..length]);
         let action = self.take_action(FaultDirection::Receive, self.rx_packet_number, identity);
-        let packet = &self.rx_scratch[..length];
         let Some(action) = action else {
             if output.len() < length {
                 return Err(FaultInjectError::OutputTooSmall {
@@ -509,10 +508,11 @@ where
                     available: output.len(),
                 });
             }
-            output[..length].copy_from_slice(packet);
+            output[..length].copy_from_slice(&self.rx_scratch[..length]);
             return Ok(Some(length));
         };
         self.count_action(action);
+        let packet = &self.rx_scratch[..length];
 
         match action {
             FaultAction::Drop => Ok(None),
@@ -582,7 +582,7 @@ fn packet_identity(packet: &[u8]) -> Option<PacketIdentity> {
 mod tests {
     use super::*;
     use crate::MockIo;
-    use rocev2_wire::{Bth, PacketSpec, UdpHeader};
+    use rocev2_wire::{Bth, PacketSpec};
 
     fn packet(opcode: Opcode, qpn: u32, psn: u32) -> [u8; 44] {
         let mut output = [0; 44];
