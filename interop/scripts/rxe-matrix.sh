@@ -13,6 +13,7 @@ SIZES=${ROCEV2_SIZES:-"0 1 255 256 257 511 512 513 1023 1024 1025 2047 2048 2049
 MTUS=${ROCEV2_MTUS:-"256 512 1024 2048 4096"}
 BASE_PORT=${ROCEV2_BASE_PORT:-18150}
 NETEM=${ROCEV2_NETEM:-}
+PERF_STAT=${ROCEV2_PERF_STAT:-0}
 
 if [[ ${EUID} -ne 0 ]]; then
     echo "rxe-matrix requires root for network namespaces, RXE, and raw sockets" >&2
@@ -23,6 +24,12 @@ for command in ip rdma modprobe ibv_devinfo ping grep; do
 done
 if [[ -n "$NETEM" ]]; then
     command -v tc >/dev/null || { echo "missing command: tc" >&2; exit 2; }
+fi
+if [[ "$PERF_STAT" == "1" ]]; then
+    command -v perf >/dev/null || { echo "missing command: perf" >&2; exit 2; }
+elif [[ "$PERF_STAT" != "0" ]]; then
+    echo "ROCEV2_PERF_STAT must be 0 or 1" >&2
+    exit 2
 fi
 [[ -x "$RUST_PEER" ]] || { echo "build the Rust peer first: interop/scripts/build-peers.sh" >&2; exit 2; }
 [[ -x "$VERBS_PEER" ]] || { echo "build the verbs peer first: interop/scripts/build-peers.sh" >&2; exit 2; }
@@ -87,9 +94,15 @@ for mtu in $MTUS; do
                 rust_requester=$((1 - verbs_requester))
                 prefix="$RESULTS/case-${case_id}-op${operation}-vr${verbs_requester}-s${size}-m${mtu}"
 
-                ip netns exec "$VERBS_NS" "$VERBS_PEER" \
-                    "$RXE_NAME" "$VERBS_IP" "$port" "$operation" "$verbs_requester" \
-                    "$size" "$mtu" "$PSN" "$ITERATIONS" >"$prefix-verbs.log" 2>&1 &
+                verbs_command=(ip netns exec "$VERBS_NS")
+                if [[ "$PERF_STAT" == "1" ]]; then
+                    verbs_command+=(perf stat -x, -e task-clock,cycles,instructions,cache-references,cache-misses -o "$prefix-verbs.perf.csv" --)
+                fi
+                verbs_command+=(
+                    "$VERBS_PEER" "$RXE_NAME" "$VERBS_IP" "$port" "$operation"
+                    "$verbs_requester" "$size" "$mtu" "$PSN" "$ITERATIONS"
+                )
+                "${verbs_command[@]}" >"$prefix-verbs.log" 2>&1 &
                 peer_pid=$!
 
                 ready=0
@@ -109,9 +122,15 @@ for mtu in $MTUS; do
                     exit 1
                 fi
 
-                if ! ip netns exec "$RUST_NS" "$RUST_PEER" \
-                    "$RUST_IP" "$VERBS_IP" "$port" "$operation" "$rust_requester" \
-                    "$size" "$mtu" "$PSN" "$ITERATIONS" >"$prefix-rust.log" 2>&1; then
+                rust_command=(ip netns exec "$RUST_NS")
+                if [[ "$PERF_STAT" == "1" ]]; then
+                    rust_command+=(perf stat -x, -e task-clock,cycles,instructions,cache-references,cache-misses -o "$prefix-rust.perf.csv" --)
+                fi
+                rust_command+=(
+                    "$RUST_PEER" "$RUST_IP" "$VERBS_IP" "$port" "$operation"
+                    "$rust_requester" "$size" "$mtu" "$PSN" "$ITERATIONS"
+                )
+                if ! "${rust_command[@]}" >"$prefix-rust.log" 2>&1; then
                     cat "$prefix-rust.log" >&2
                     cat "$prefix-verbs.log" >&2
                     exit 1
