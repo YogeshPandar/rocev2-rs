@@ -14,6 +14,7 @@ categories.workspace = true
 [features]
 default = ["std", "raw-ipv4"]
 std = ["rocev2-io/std"]
+placement = ["std", "rocev2-io/placement"]
 raw-ipv4 = ["std", "rocev2-io/raw-ipv4"]
 afxdp = ["std", "rocev2-io/afxdp"]
 

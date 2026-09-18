@@ -20,6 +20,7 @@
 
 extern crate alloc;
 
+mod connection;
 mod endpoint;
 mod error;
 #[cfg(all(target_os = "linux", any(feature = "raw-ipv4", feature = "afxdp")))]
@@ -30,6 +31,7 @@ mod rc;
 #[cfg(all(target_os = "linux", any(feature = "raw-ipv4", feature = "afxdp")))]
 pub use keys::SystemKeyGenerator;
 
+pub use connection::{ConnectionInfoError, RC_CONNECTION_INFO_LEN, RcConnectionInfo};
 pub use endpoint::{Endpoint, EndpointConfig, EndpointStats, PollProgress};
 pub use error::{ApiError, PollError, QueueKind};
 pub use packet::{

@@ -13,6 +13,7 @@ categories.workspace = true
 [features]
 default = ["std", "raw-ipv4"]
 std = []
+placement = ["std", "dep:libc"]
 raw-ipv4 = ["std", "dep:libc"]
 afxdp = ["std", "dep:libc", "dep:aya-obj"]
 
