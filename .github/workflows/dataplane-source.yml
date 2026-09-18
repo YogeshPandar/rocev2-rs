@@ -1,0 +1,17 @@
+name: dataplane-source
+on:
+  push:
+    branches: [feat/dataplane-lifetime-hardening]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: git archive --format=tar -o /tmp/source.tar HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dataplane-source-${{ github.sha }}
+          path: /tmp/source.tar
+          retention-days: 1
