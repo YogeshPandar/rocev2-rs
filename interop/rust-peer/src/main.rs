@@ -1,4 +1,7 @@
-use rocev2::io::{RawIpv4Config, RawIpv4Socket};
+use rocev2::io::{
+    AfxdpBindMode, AfxdpConfig, AfxdpError, AfxdpSocket, EthernetPath, PacketIo, RawIpv4Config,
+    RawIpv4Socket, XdpSteering,
+};
 use rocev2::{
     AccessFlags, Completion, CompletionOpcode, CompletionStatus, QpState, RC_CONNECTION_INFO_LEN,
     RcConnectionInfo, RcEndpoint, RcEndpointConfig, RecvWorkRequest, RegionHandle, Sge,
@@ -6,6 +9,7 @@ use rocev2::{
 };
 use std::env;
 use std::error::Error;
+use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::time::{Duration, Instant};
@@ -20,8 +24,78 @@ const RNR_TIMER: u8 = 1;
 const QP_DEPTH: u8 = 1;
 const REQUEST_LEN: usize = 16;
 
-type PeerEndpoint<'a> = RcEndpoint<'a, RawIpv4Socket, 1, 1, 8, 8, 16, 2>;
+type PeerEndpoint<'a> = RcEndpoint<'a, PeerIo, 1, 1, 8, 8, 16, 2>;
 type DynError = Box<dyn Error + Send + Sync>;
+
+#[derive(Debug)]
+enum PeerIoError {
+    Raw(io::Error),
+    Afxdp(AfxdpError),
+}
+
+impl fmt::Display for PeerIoError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Raw(error) => write!(formatter, "raw IPv4 I/O failed: {error}"),
+            Self::Afxdp(error) => write!(formatter, "AF_XDP I/O failed: {error}"),
+        }
+    }
+}
+
+impl Error for PeerIoError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Raw(error) => Some(error),
+            Self::Afxdp(error) => Some(error),
+        }
+    }
+}
+
+impl From<io::Error> for PeerIoError {
+    fn from(error: io::Error) -> Self {
+        Self::Raw(error)
+    }
+}
+
+impl From<AfxdpError> for PeerIoError {
+    fn from(error: AfxdpError) -> Self {
+        Self::Afxdp(error)
+    }
+}
+
+#[derive(Debug)]
+enum PeerIo {
+    Raw(RawIpv4Socket),
+    Afxdp {
+        socket: AfxdpSocket,
+        _steering: XdpSteering,
+    },
+}
+
+impl PacketIo for PeerIo {
+    type Error = PeerIoError;
+
+    fn max_ipv4_packet(&self) -> usize {
+        match self {
+            Self::Raw(socket) => socket.max_ipv4_packet(),
+            Self::Afxdp { socket, .. } => socket.max_ipv4_packet(),
+        }
+    }
+
+    fn transmit_ipv4(&mut self, packet: &[u8]) -> Result<(), Self::Error> {
+        match self {
+            Self::Raw(socket) => socket.transmit_ipv4(packet).map_err(Into::into),
+            Self::Afxdp { socket, .. } => socket.transmit_ipv4(packet).map_err(Into::into),
+        }
+    }
+
+    fn receive_ipv4(&mut self, output: &mut [u8]) -> Result<Option<usize>, Self::Error> {
+        match self {
+            Self::Raw(socket) => socket.receive_ipv4(output).map_err(Into::into),
+            Self::Afxdp { socket, .. } => socket.receive_ipv4(output).map_err(Into::into),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {
@@ -123,6 +197,79 @@ where
     value
         .parse::<T>()
         .map_err(|error| format!("invalid {name}: {error}").into())
+}
+
+fn env_number<T>(name: &str) -> Result<T, DynError>
+where
+    T: std::str::FromStr,
+    T::Err: Error + Send + Sync + 'static,
+{
+    let value = env::var(name).map_err(|_| format!("{name} is required for AF_XDP"))?;
+    parse_number(&value, name)
+}
+
+fn parse_mac(name: &str) -> Result<[u8; 6], DynError> {
+    let value = env::var(name).map_err(|_| format!("{name} is required for AF_XDP"))?;
+    let mut output = [0_u8; 6];
+    let mut fields = value.split(':');
+    for byte in &mut output {
+        let field = fields.next().ok_or_else(|| format!("invalid {name}"))?;
+        if field.len() != 2 {
+            return Err(format!("invalid {name}").into());
+        }
+        *byte = u8::from_str_radix(field, 16).map_err(|_| format!("invalid {name}"))?;
+    }
+    if fields.next().is_some() {
+        return Err(format!("invalid {name}").into());
+    }
+    Ok(output)
+}
+
+fn open_io(config: Config, packet_size: usize) -> Result<PeerIo, DynError> {
+    match env::var("ROCEV2_BACKEND")
+        .unwrap_or_else(|_| String::from("raw"))
+        .as_str()
+    {
+        "raw" => Ok(PeerIo::Raw(RawIpv4Socket::bind(RawIpv4Config {
+            bind_address: config.local_ip,
+            max_ipv4_packet: packet_size,
+        })?)),
+        "afxdp" => {
+            let interface_index = env_number::<u32>("ROCEV2_IFINDEX")?;
+            let queue_id = env::var("ROCEV2_QUEUE")
+                .map_or_else(|_| Ok(0_u32), |value| parse_number(&value, "ROCEV2_QUEUE"))?;
+            let queue_count = env::var("ROCEV2_QUEUE_COUNT").map_or_else(
+                |_| queue_id.checked_add(1).ok_or("queue count overflow".into()),
+                |value| parse_number(&value, "ROCEV2_QUEUE_COUNT"),
+            )?;
+            if interface_index == 0 || queue_count == 0 || queue_id >= queue_count {
+                return Err("invalid AF_XDP interface or queue configuration".into());
+            }
+            let ethernet = EthernetPath::new(
+                parse_mac("ROCEV2_SOURCE_MAC")?,
+                parse_mac("ROCEV2_DEST_MAC")?,
+            );
+            let steering = XdpSteering::attach(interface_index, queue_count)?;
+            let mut afxdp = AfxdpConfig::new(interface_index, queue_id, ethernet);
+            if env::var_os("ROCEV2_ALLOW_COPY_FALLBACK").is_some() {
+                afxdp.bind_mode = AfxdpBindMode::AllowCopyFallback;
+            }
+            let mut socket = AfxdpSocket::bind(afxdp)?;
+            socket.attach_steering(&steering)?;
+            if socket.max_ipv4_packet() < packet_size {
+                return Err(format!(
+                    "AF_XDP frame supports at most {} IPv4 bytes, workload needs {packet_size}",
+                    socket.max_ipv4_packet()
+                )
+                .into());
+            }
+            Ok(PeerIo::Afxdp {
+                socket,
+                _steering: steering,
+            })
+        }
+        backend => Err(format!("unknown ROCEV2_BACKEND {backend:?}; use raw or afxdp").into()),
+    }
 }
 
 fn is_unicast(address: Ipv4Addr) -> bool {
@@ -500,10 +647,7 @@ fn run(config: Config) -> Result<(), DynError> {
     let packet_size = usize::from(config.mtu)
         .checked_add(64)
         .ok_or("packet size overflow")?;
-    let io = RawIpv4Socket::bind(RawIpv4Config {
-        bind_address: config.local_ip,
-        max_ipv4_packet: packet_size,
-    })?;
+    let io = open_io(config, packet_size)?;
     let mut endpoint = PeerEndpoint::new(
         io,
         RcEndpointConfig {
