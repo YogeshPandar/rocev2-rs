@@ -12,7 +12,7 @@ concurrency:
 jobs:
   review:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,14 +40,16 @@ jobs:
           git rm .review/release-code.patch
           cargo +stable fmt --all
           cargo +1.85.0 generate-lockfile
-          if test -f fuzz/Cargo.toml; then
-            cargo +stable fmt --manifest-path fuzz/Cargo.toml
-            cargo +stable generate-lockfile --manifest-path fuzz/Cargo.toml
-          fi
+          for manifest in fuzz/Cargo.toml interop/rust-peer/Cargo.toml tools/qualification/Cargo.toml; do
+            if test -f "$manifest"; then
+              cargo +stable fmt --manifest-path "$manifest"
+              cargo +stable generate-lockfile --manifest-path "$manifest"
+            fi
+          done
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
-          git commit -m 'fix: restore qualification gates and harden decoders'
+          git commit -m 'feat: add executable release qualification tooling'
           git push origin HEAD:feat/release-code-hardening
       - name: Workspace tests
         run: cargo +stable test --locked --workspace --all-features --all-targets
@@ -57,16 +59,18 @@ jobs:
         run: cargo +stable check --locked --workspace --no-default-features --target thumbv7em-none-eabihf
       - name: MSRV
         run: cargo +1.85.0 check --locked --workspace --all-features
+      - name: Hosted tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libibverbs-dev
+          cargo +stable test --locked --manifest-path interop/rust-peer/Cargo.toml
+          cargo +stable clippy --locked --manifest-path interop/rust-peer/Cargo.toml --all-targets -- -D warnings
+          cargo +1.85.0 check --locked --manifest-path interop/rust-peer/Cargo.toml
+          cargo +stable test --locked --manifest-path tools/qualification/Cargo.toml
+          cargo +stable clippy --locked --manifest-path tools/qualification/Cargo.toml --all-targets -- -D warnings
+          cargo +1.85.0 check --locked --manifest-path tools/qualification/Cargo.toml
+          make -C interop/rxe-peer clean test
+          python3 -m unittest discover -s interop/tests -v
+          bash -n interop/scripts/*.sh
       - name: Fuzz oracle smoke
         run: cargo +stable test --locked --manifest-path fuzz/Cargo.toml --lib
-      - name: Publish diagnostics
-        if: ${{ failure() }}
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: 9,
-              body: 'Release-code checkpoint failed in run ' + context.runId + ': ' + context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId
-            })
