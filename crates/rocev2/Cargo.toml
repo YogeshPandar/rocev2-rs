@@ -12,9 +12,10 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["raw-ipv4"]
-raw-ipv4 = ["rocev2-io/raw-ipv4"]
-afxdp = ["rocev2-io/afxdp"]
+default = ["std", "raw-ipv4"]
+std = ["rocev2-io/std"]
+raw-ipv4 = ["std", "rocev2-io/raw-ipv4"]
+afxdp = ["std", "rocev2-io/afxdp"]
 
 [dependencies]
 rocev2-core = { path = "../rocev2-core", version = "0.1.0" }

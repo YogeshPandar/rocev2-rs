@@ -11,9 +11,10 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["raw-ipv4"]
-raw-ipv4 = ["dep:libc"]
-afxdp = ["dep:libc"]
+default = ["std", "raw-ipv4"]
+std = []
+raw-ipv4 = ["std", "dep:libc"]
+afxdp = ["std", "dep:libc"]
 
 [dependencies]
 libc = { version = "0.2", optional = true }

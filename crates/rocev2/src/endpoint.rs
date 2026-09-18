@@ -5,6 +5,7 @@ use crate::{
     ApiError, DecodedPacket, Ipv4Path, MIN_ROCE_IPV4_PACKET, PollError, QpHandle,
     decode_ipv4_packet, encode_ipv4_packet,
 };
+use alloc::boxed::Box;
 use rocev2_core::{
     AckAdvance, Psn, QpConfig, QpState, QpStateMachine, QpnTable, ReceiveDisposition, ReceivePsn,
     SendWindow,
@@ -408,7 +409,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use rocev2_core::PathMtu;

@@ -4,6 +4,7 @@
 //! the batch trait adds explicit receive and transmit frame ownership so
 //! `AF_XDP` can expose UMEM frames without transport copies.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 #[allow(unsafe_code)]
@@ -11,6 +12,7 @@
 mod afxdp;
 mod ethernet;
 mod fixed;
+#[cfg(feature = "std")]
 mod mock;
 
 #[allow(unsafe_code)]
@@ -24,6 +26,7 @@ pub use afxdp::{
 };
 pub use ethernet::{ETHERNET_HEADER_LEN, EthernetPath};
 pub use fixed::{FixedFrame, FixedPacketIo, FixedPacketIoError, FixedRxFrame, FixedTxFrame};
+#[cfg(feature = "std")]
 pub use mock::{Frame, MockIo, MockIoError};
 #[cfg(all(feature = "raw-ipv4", target_os = "linux"))]
 pub use raw_ipv4::{RawIpv4Config, RawIpv4Socket};
@@ -31,7 +34,7 @@ pub use raw_ipv4::{RawIpv4Config, RawIpv4Socket};
 /// nonblocking complete-ipv4-packet i/o.
 pub trait PacketIo {
     /// backend-specific error.
-    type Error: std::error::Error + Send + Sync + 'static;
+    type Error: core::error::Error + Send + Sync + 'static;
 
     /// maximum complete ipv4 packet accepted by this backend.
     #[must_use]
@@ -161,11 +164,11 @@ impl<E: core::fmt::Display> core::fmt::Display for SubmitError<E> {
     }
 }
 
-impl<E> std::error::Error for SubmitError<E>
+impl<E> core::error::Error for SubmitError<E>
 where
-    E: std::error::Error + 'static,
+    E: core::error::Error + 'static,
 {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         Some(&self.error)
     }
 }

@@ -126,7 +126,7 @@ impl fmt::Display for FixedPacketIoError {
     }
 }
 
-impl std::error::Error for FixedPacketIoError {}
+impl core::error::Error for FixedPacketIoError {}
 
 #[derive(Debug)]
 struct IndexRing<const N: usize> {

@@ -15,7 +15,10 @@
 //! scheduling. Linux RXE and hardware interoperability remain explicit
 //! pre-1.0 qualification gates.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
+
+extern crate alloc;
 
 mod endpoint;
 mod error;

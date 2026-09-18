@@ -10,6 +10,7 @@ use crate::{
     ApiError, DecodedPacket, Ipv4Path, MIN_ROCE_IPV4_PACKET, PollError, QpHandle, QueueKind,
     decode_ipv4_packet, encode_ipv4_packet,
 };
+use alloc::boxed::Box;
 use rocev2_core::{
     AckAdvance, Completion, CompletionOpcode, CompletionStatus, MAX_OUTSTANDING_PACKETS, Psn,
     QpConfig, QpState, QpStateMachine, QpnTable, ReadyQueue, ReceiveDisposition, ReceivePsn,
