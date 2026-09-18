@@ -6,11 +6,12 @@ WRITE, or RDMA READ operations to libibverbs, librdmacm, UCX, rdma-core, or
 Linux RXE.
 
 > **Status: pre-1.0 engineering preview.** A fixed-capacity RC execution engine
-> now posts and executes SEND, WRITE, and READ in deterministic software tests,
+> posts and executes SEND, WRITE, and READ in deterministic software tests,
 > including completions, segmentation, ACK/NAK/RNR, duplicate suppression, and
-> retry scheduling. The AF_XDP UMEM/ring/socket foundation is implemented, while
-> XDP steering, Linux RXE and hardware-RNIC interoperability, sustained fuzzing,
-> and performance qualification are still release blockers. Do not expose untrusted memory or production traffic yet.
+> retry scheduling. AF_XDP UMEM/rings, completion ownership, native XDP steering,
+> and XSKMAP lifecycle are implemented. Linux RXE and hardware-RNIC
+> interoperability, sustained fuzzing, and performance qualification remain
+> release blockers. Do not expose untrusted memory or production traffic yet.
 
 ## Workspace
 
@@ -18,8 +19,8 @@ Linux RXE.
 |---|---|
 | `rocev2-wire` | `no_std`, allocation-free BTH/RETH/AETH, IPv4/UDP, and ICRC |
 | `rocev2-core` | `no_std` PSN, QP, retry, segmentation, fixed-ring, QPN-index, and active-QP scheduling primitives |
-| `rocev2-memory` | generation-tagged lkey/rkey registration and checked access |
-| `rocev2-io` | backend-neutral packet I/O, deterministic mock I/O, raw IPv4, and the AF_XDP foundation |
+| `rocev2-memory` | full-width lkey/rkey registration, MR leases, and checked access |
+| `rocev2-io` | packet I/O, fixed fault injection, raw IPv4, AF_XDP, and XDP/XSKMAP steering |
 | `rocev2` | endpoint composition and fixed-capacity RC posted-work engine |
 
 The current scope is deliberately narrow: RoCEv2 over IPv4, RC QPs, one SGE
@@ -30,7 +31,9 @@ band; RDMA-CM is not part of the current implementation.
 
 `RcEndpoint` owns a fixed QP table, an open-addressed local-QPN index, fixed
 SQ/RQ/CQ rings, requester and responder ready queues, an indexed deadline heap,
-a checked memory registry, and one packet of scratch space. Incoming packets
+a checked memory registry, and scalar compatibility scratch space. Batched TX
+borrows validated registered-memory payloads directly into final backend frames.
+Incoming packets
 use the QPN index instead of scanning every live QP. Posting and protocol events
 schedule a QP exactly once; progress pops only runnable QPs and expired
 deadlines rather than walking the QP table. Segmented transfers return to the
@@ -43,8 +46,8 @@ Ready-queue insertion, cancellation, and removal are O(1). Timer arm, update,
 cancellation, and expiry are O(log QPs), while reading the next deadline is
 O(1). QPs and their rings allocate only on the control path. Once the endpoint,
 QPs, and MRs exist, posting, polling, packet parsing/encoding, ACK processing,
-memory copies, scheduling, and retries do not perform transport-owned heap
-allocations.
+memory access, scheduling, retries, and batch packet encoding do not perform
+transport-owned heap allocations.
 
 The default endpoint reserves 2,048 QPN-index entries for 1,024 QP slots. A
 custom `QPN_INDEX` capacity must be a power of two and at least twice `QPS`,
@@ -55,7 +58,7 @@ and reconfigured.
 use std::net::Ipv4Addr;
 use rocev2::{
     AccessFlags, Ipv4Path, PathMtu, Psn, QpConfig, QpState, RcEndpoint,
-    RcEndpointConfig, RcQpConfig, Sge, WorkRequest,
+    RcEndpointConfig, RcQpConfig, Sge, SystemKeyGenerator, WorkRequest,
 };
 use rocev2::io::{RawIpv4Config, RawIpv4Socket};
 
@@ -78,11 +81,13 @@ let mut endpoint = HostEndpoint::new(
 )?;
 
 let mut buffer = [0_u8; 4096];
-let mr = endpoint.register_memory(
+let mut keys = SystemKeyGenerator::new()?;
+let mr = endpoint.register_memory_with_key_generator(
     &mut buffer,
     AccessFlags::LOCAL_WRITE
         | AccessFlags::REMOTE_WRITE
         | AccessFlags::REMOTE_READ,
+    &mut keys,
 )?;
 
 // QPNs, PSNs, MTU, rkey, and remote virtual address come from an
@@ -155,9 +160,7 @@ implementation.
 cargo fmt --all --check
 cargo test --workspace --all-features --all-targets
 cargo clippy --workspace --all-features --all-targets -- -D warnings
-cargo check -p rocev2-wire --target thumbv7em-none-eabihf
-cargo check -p rocev2-core --target thumbv7em-none-eabihf
-cargo check -p rocev2-memory --target thumbv7em-none-eabihf
+cargo check --workspace --no-default-features --target thumbv7em-none-eabihf
 ```
 
 Dual-licensed under MIT or Apache-2.0.

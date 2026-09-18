@@ -199,8 +199,8 @@ impl fmt::Display for ApiError {
     }
 }
 
-impl std::error::Error for ApiError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for ApiError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Wire(error) => Some(error),
             Self::Memory(error) => Some(error),
@@ -251,11 +251,11 @@ impl<E: fmt::Display> fmt::Display for PollError<E> {
     }
 }
 
-impl<E> std::error::Error for PollError<E>
+impl<E> core::error::Error for PollError<E>
 where
-    E: std::error::Error + 'static,
+    E: core::error::Error + 'static,
 {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
             Self::Api(error) => Some(error),

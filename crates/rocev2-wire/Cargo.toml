@@ -15,3 +15,7 @@ default = []
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "icrc"
+harness = false

@@ -1,6 +1,6 @@
 //! Black-box RC endpoint execution and reliability tests.
 
-use rocev2::io::{Frame, MockIo, PacketIo};
+use rocev2::io::{FaultAction, FaultDirection, FaultInjectIo, FaultRule, Frame, MockIo, PacketIo};
 use rocev2::memory::AccessFlags;
 use rocev2::wire::{Aeth, AethClass, Bth, Opcode, PacketSpec, Reth};
 use rocev2::{
@@ -10,6 +10,7 @@ use rocev2::{
 };
 
 type TestEndpoint<'a> = RcEndpoint<'a, MockIo, 2, 8, 8, 8, 16, 4>;
+type FaultEndpoint<'a> = RcEndpoint<'a, FaultInjectIo<MockIo, 8, 512>, 2, 8, 8, 8, 16, 4>;
 
 #[derive(Debug)]
 struct FailOnceIo {
@@ -71,6 +72,18 @@ fn endpoint<'a>() -> TestEndpoint<'a> {
             maximum_packet_size: 512,
             ticks_per_second: 1_000_000,
             memory_key_seed: 7,
+        },
+    )
+    .unwrap()
+}
+
+fn fault_endpoint<'a>() -> FaultEndpoint<'a> {
+    RcEndpoint::new(
+        FaultInjectIo::new(MockIo::new(512)),
+        RcEndpointConfig {
+            maximum_packet_size: 512,
+            ticks_per_second: 1_000_000,
+            memory_key_seed: 17,
         },
     )
     .unwrap()
@@ -173,12 +186,11 @@ fn rc_qpn_index_tracks_collision_removal_and_reconfiguration() {
         .io_mut()
         .inject_receive(&packet[..old_length])
         .unwrap();
-    assert!(matches!(
-        endpoint.progress(0, &mut receive, &mut transmit),
-        Err(rocev2::PollError::Api(
-            rocev2::ApiError::UnknownDestinationQpn(3)
-        ))
-    ));
+    let dropped = endpoint.progress(0, &mut receive, &mut transmit).unwrap();
+    assert_eq!(dropped.received_packets, 1);
+    assert_eq!(dropped.transmitted_packets, 0);
+    assert_eq!(endpoint.stats().unknown_qp_packets, 1);
+    assert_eq!(endpoint.stats().dropped_packets, 1);
 
     let new_length = encode_ipv4_packet(
         peer_path,
@@ -199,6 +211,59 @@ fn rc_qpn_index_tracks_collision_removal_and_reconfiguration() {
     let progress = endpoint.progress(1, &mut receive, &mut transmit).unwrap();
     assert_eq!(progress.received_packets, 1);
     assert_eq!(progress.transmitted_packets, 1);
+}
+
+#[test]
+fn malformed_and_wrong_peer_packets_are_contained_as_drops() {
+    let mut endpoint = endpoint();
+    let qp = endpoint
+        .create_qp(qp_config(2, 3, 10, 30, [192, 0, 2, 1], [192, 0, 2, 2]))
+        .unwrap();
+    ready(&mut endpoint, qp);
+
+    let mut packet = [0_u8; 512];
+    let mut receive = [0_u8; 512];
+    let mut transmit = [0_u8; 512];
+    let wrong_peer = Ipv4Path::new([192, 0, 2, 99], [192, 0, 2, 1], 49_152);
+    let length = encode_ipv4_packet(
+        wrong_peer,
+        PacketSpec {
+            bth: Bth::new(Opcode::SendOnly, 2, 30),
+            reth: None,
+            aeth: None,
+            immediate_data: None,
+            payload: b"x",
+        },
+        &mut packet,
+    )
+    .unwrap();
+    endpoint.io_mut().inject_receive(&packet[..length]).unwrap();
+    let progress = endpoint.progress(0, &mut receive, &mut transmit).unwrap();
+    assert_eq!(progress.received_packets, 1);
+    assert_eq!(progress.transmitted_packets, 0);
+    assert_eq!(endpoint.stats().peer_mismatch_packets, 1);
+    assert_eq!(endpoint.stats().dropped_packets, 1);
+
+    let correct_peer = Ipv4Path::new([192, 0, 2, 2], [192, 0, 2, 1], 49_152);
+    let length = encode_ipv4_packet(
+        correct_peer,
+        PacketSpec {
+            bth: Bth::new(Opcode::SendOnly, 2, 30),
+            reth: None,
+            aeth: None,
+            immediate_data: None,
+            payload: b"x",
+        },
+        &mut packet,
+    )
+    .unwrap();
+    packet[length - 1] ^= 1;
+    endpoint.io_mut().inject_receive(&packet[..length]).unwrap();
+    let progress = endpoint.progress(1, &mut receive, &mut transmit).unwrap();
+    assert_eq!(progress.received_packets, 1);
+    assert_eq!(progress.transmitted_packets, 0);
+    assert_eq!(endpoint.stats().invalid_packets, 1);
+    assert_eq!(endpoint.stats().dropped_packets, 2);
 }
 
 fn read_replay_qps(requester: &mut TestEndpoint<'_>, responder: &mut TestEndpoint<'_>) -> QpHandle {
@@ -635,6 +700,94 @@ fn timeout_retransmits_a_dropped_request() {
     );
     assert!(requester.stats().timeout_events >= 1);
     assert!(requester.stats().retransmissions >= 1);
+}
+
+#[test]
+fn fault_injector_drop_drives_real_timeout_retransmission() {
+    let mut source = [0x39_u8; 8];
+    let mut destination = [0_u8; 8];
+    let mut requester = fault_endpoint();
+    let mut responder = endpoint();
+    let source_mr = requester
+        .register_memory(&mut source, AccessFlags::NONE)
+        .unwrap();
+    let destination_mr = responder
+        .register_memory(&mut destination, AccessFlags::LOCAL_WRITE)
+        .unwrap();
+    let requester_qp = requester
+        .create_qp(qp_config(2, 3, 5, 50, [10, 4, 0, 1], [10, 4, 0, 2]))
+        .unwrap();
+    let responder_qp = responder
+        .create_qp(qp_config(3, 2, 50, 5, [10, 4, 0, 2], [10, 4, 0, 1]))
+        .unwrap();
+    requester
+        .transition_qp(requester_qp, QpState::Init)
+        .unwrap();
+    requester.transition_qp(requester_qp, QpState::Rtr).unwrap();
+    requester.transition_qp(requester_qp, QpState::Rts).unwrap();
+    ready(&mut responder, responder_qp);
+    responder
+        .post_receive(
+            responder_qp,
+            RecvWorkRequest::new(
+                2,
+                Sge::new(destination_mr.address(), 8, destination_mr.lkey()),
+            ),
+        )
+        .unwrap();
+    requester
+        .io_mut()
+        .push_rule(
+            FaultRule::new(FaultAction::Drop, FaultDirection::Transmit)
+                .opcode(Opcode::SendOnly)
+                .qpn(3)
+                .psn(5),
+        )
+        .unwrap();
+    requester
+        .post_work(
+            requester_qp,
+            WorkRequest::send(1, Sge::new(source_mr.address(), 8, source_mr.lkey()), true),
+        )
+        .unwrap();
+
+    let mut rx = [0_u8; 512];
+    let mut tx = [0_u8; 512];
+    requester.progress(0, &mut rx, &mut tx).unwrap();
+    assert_eq!(requester.io().statistics().dropped, 1);
+    assert!(requester.io_mut().inner_mut().pop_transmitted().is_none());
+
+    requester.progress(5, &mut rx, &mut tx).unwrap();
+    let retry = requester
+        .io_mut()
+        .inner_mut()
+        .pop_transmitted()
+        .expect("timeout retransmission");
+    responder.io_mut().inject_receive(retry.as_bytes()).unwrap();
+    responder.progress(5, &mut rx, &mut tx).unwrap();
+    let ack = responder.io_mut().pop_transmitted().expect("send ack");
+    requester
+        .io_mut()
+        .inner_mut()
+        .inject_receive(ack.as_bytes())
+        .unwrap();
+    requester.progress(6, &mut rx, &mut tx).unwrap();
+
+    assert_eq!(
+        responder
+            .memory_registry()
+            .local_read_slice(destination_mr.lkey(), destination_mr.address(), 8)
+            .unwrap(),
+        &[0x39; 8]
+    );
+    assert!(
+        requester
+            .poll_completion(requester_qp)
+            .unwrap()
+            .is_some_and(Completion::is_success)
+    );
+    assert_eq!(requester.stats().timeout_events, 1);
+    assert_eq!(requester.stats().retransmissions, 1);
 }
 
 #[test]
@@ -1226,4 +1379,90 @@ fn read_responder_remains_scheduled_after_backend_transmit_failure() {
     assert_eq!(packet.transport.bth.opcode, Opcode::RdmaReadResponseOnly);
     assert_eq!(packet.transport.bth.psn, 70);
     assert_eq!(packet.transport.payload, &[0x85; 8]);
+}
+
+#[test]
+fn posted_memory_stays_busy_until_reset_or_error_flush() {
+    for destination in [QpState::Reset, QpState::Error] {
+        let mut bytes = [0x22; 16];
+        let mut endpoint = endpoint();
+        let mr = endpoint
+            .register_memory(&mut bytes, AccessFlags::LOCAL_WRITE)
+            .unwrap();
+        let qp = endpoint
+            .create_qp(qp_config(2, 3, 10, 30, [192, 0, 2, 1], [192, 0, 2, 2]))
+            .unwrap();
+        ready(&mut endpoint, qp);
+        let sge = Sge::new(mr.address(), 8, mr.lkey());
+        endpoint
+            .post_work_batch(
+                qp,
+                &[
+                    WorkRequest::send(1, sge, false),
+                    WorkRequest::send(2, sge, true),
+                ],
+            )
+            .unwrap();
+        endpoint
+            .post_receive_batch(
+                qp,
+                &[RecvWorkRequest::new(3, sge), RecvWorkRequest::new(4, sge)],
+            )
+            .unwrap();
+        assert!(matches!(
+            endpoint.deregister_memory(mr),
+            Err(rocev2::ApiError::Memory(rocev2::MemoryError::RegionBusy))
+        ));
+        let mut receive = [0; 512];
+        let mut transmit = [0; 512];
+        endpoint.progress(0, &mut receive, &mut transmit).unwrap();
+        assert!(matches!(
+            endpoint.deregister_memory(mr),
+            Err(rocev2::ApiError::Memory(rocev2::MemoryError::RegionBusy))
+        ));
+        endpoint.transition_qp(qp, destination).unwrap();
+        endpoint.deregister_memory(mr).unwrap();
+        let mut completions = 0;
+        while let Some(completion) = endpoint.poll_completion(qp).unwrap() {
+            assert_eq!(completion.status, CompletionStatus::Flushed);
+            completions += 1;
+        }
+        assert_eq!(completions, 4);
+    }
+}
+
+#[test]
+fn rejected_batch_does_not_retain_valid_prefix() {
+    let mut bytes = [0; 8];
+    let mut endpoint = endpoint();
+    let mr = endpoint
+        .register_memory(&mut bytes, AccessFlags::LOCAL_WRITE)
+        .unwrap();
+    let qp = endpoint
+        .create_qp(qp_config(2, 3, 10, 30, [192, 0, 2, 1], [192, 0, 2, 2]))
+        .unwrap();
+    ready(&mut endpoint, qp);
+    let good = Sge::new(mr.address(), 8, mr.lkey());
+    let bad = Sge::new(mr.address(), 9, mr.lkey());
+    assert!(
+        endpoint
+            .post_work_batch(
+                qp,
+                &[
+                    WorkRequest::send(1, good, true),
+                    WorkRequest::send(2, bad, true)
+                ]
+            )
+            .is_err()
+    );
+    assert!(
+        endpoint
+            .post_receive_batch(
+                qp,
+                &[RecvWorkRequest::new(3, good), RecvWorkRequest::new(4, bad)]
+            )
+            .is_err()
+    );
+    endpoint.deregister_memory(mr).unwrap();
+    assert_eq!(endpoint.poll_completion(qp).unwrap(), None);
 }

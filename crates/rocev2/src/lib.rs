@@ -15,13 +15,20 @@
 //! scheduling. Linux RXE and hardware interoperability remain explicit
 //! pre-1.0 qualification gates.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
+
+extern crate alloc;
 
 mod endpoint;
 mod error;
+#[cfg(all(target_os = "linux", any(feature = "raw-ipv4", feature = "afxdp")))]
+mod keys;
 mod packet;
 mod qp;
 mod rc;
+#[cfg(all(target_os = "linux", any(feature = "raw-ipv4", feature = "afxdp")))]
+pub use keys::SystemKeyGenerator;
 
 pub use endpoint::{Endpoint, EndpointConfig, EndpointStats, PollProgress};
 pub use error::{ApiError, PollError, QueueKind};
@@ -42,7 +49,10 @@ pub use rocev2_core::{
     Completion, CompletionOpcode, CompletionStatus, PathMtu, Psn, QpConfig, QpState,
     RecvWorkRequest, Sge, WorkRequest, WorkRequestKind,
 };
-pub use rocev2_memory::{AccessFlags, MemoryError, MemoryRegistry, RegionHandle, RemoteMemory};
+pub use rocev2_memory::{
+    AccessFlags, KeyGenerator, MemoryAccess, MemoryError, MemoryRegistry, RegionHandle,
+    RegionLease, RemoteMemory,
+};
 
 /// Compatibility name for registered-memory access rights.
 pub type Access = AccessFlags;

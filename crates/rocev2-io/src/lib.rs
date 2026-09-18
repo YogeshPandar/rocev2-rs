@@ -4,13 +4,26 @@
 //! the batch trait adds explicit receive and transmit frame ownership so
 //! `AF_XDP` can expose UMEM frames without transport copies.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 #[allow(unsafe_code)]
 #[cfg(all(feature = "afxdp", target_os = "linux"))]
 mod afxdp;
+#[allow(unsafe_code)]
+#[cfg(all(feature = "afxdp", target_os = "linux"))]
+mod xdp;
+#[cfg(all(feature = "afxdp", target_os = "linux"))]
+pub use xdp::XdpSteering;
+#[allow(unsafe_code)]
+#[cfg(all(target_os = "linux", any(feature = "raw-ipv4", feature = "afxdp")))]
+mod entropy;
 mod ethernet;
+mod fault;
 mod fixed;
+#[cfg(all(target_os = "linux", any(feature = "raw-ipv4", feature = "afxdp")))]
+pub use entropy::fill_random;
+#[cfg(feature = "std")]
 mod mock;
 
 #[allow(unsafe_code)]
@@ -23,7 +36,12 @@ pub use afxdp::{
     AfxdpStatistics, AfxdpTxFrame, UmemBacking,
 };
 pub use ethernet::{ETHERNET_HEADER_LEN, EthernetPath};
+pub use fault::{
+    FaultAction, FaultDirection, FaultInjectError, FaultInjectIo, FaultRule, FaultRuleError,
+    FaultStatistics,
+};
 pub use fixed::{FixedFrame, FixedPacketIo, FixedPacketIoError, FixedRxFrame, FixedTxFrame};
+#[cfg(feature = "std")]
 pub use mock::{Frame, MockIo, MockIoError};
 #[cfg(all(feature = "raw-ipv4", target_os = "linux"))]
 pub use raw_ipv4::{RawIpv4Config, RawIpv4Socket};
@@ -31,7 +49,7 @@ pub use raw_ipv4::{RawIpv4Config, RawIpv4Socket};
 /// nonblocking complete-ipv4-packet i/o.
 pub trait PacketIo {
     /// backend-specific error.
-    type Error: std::error::Error + Send + Sync + 'static;
+    type Error: core::error::Error + Send + Sync + 'static;
 
     /// maximum complete ipv4 packet accepted by this backend.
     #[must_use]
@@ -161,11 +179,11 @@ impl<E: core::fmt::Display> core::fmt::Display for SubmitError<E> {
     }
 }
 
-impl<E> std::error::Error for SubmitError<E>
+impl<E> core::error::Error for SubmitError<E>
 where
-    E: std::error::Error + 'static,
+    E: core::error::Error + 'static,
 {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         Some(&self.error)
     }
 }

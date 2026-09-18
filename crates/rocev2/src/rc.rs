@@ -10,6 +10,7 @@ use crate::{
     ApiError, DecodedPacket, Ipv4Path, MIN_ROCE_IPV4_PACKET, PollError, QpHandle, QueueKind,
     decode_ipv4_packet, encode_ipv4_packet,
 };
+use alloc::boxed::Box;
 use rocev2_core::{
     AckAdvance, Completion, CompletionOpcode, CompletionStatus, MAX_OUTSTANDING_PACKETS, Psn,
     QpConfig, QpState, QpStateMachine, QpnTable, ReadyQueue, ReceiveDisposition, ReceivePsn,
@@ -17,7 +18,9 @@ use rocev2_core::{
     TimerEntry, TimerScheduler, WorkRequest, WorkRequestKind, ack_timeout_ticks, rnr_timer_ticks,
 };
 use rocev2_io::{PacketBatchIo, PacketIo, TxPacket};
-use rocev2_memory::{AccessFlags, MemoryError, MemoryRegistry, RegionHandle};
+use rocev2_memory::{
+    AccessFlags, KeyGenerator, MemoryAccess, MemoryError, MemoryRegistry, RegionHandle, RegionLease,
+};
 use rocev2_wire::{
     AETH_LEN, Aeth, AethClass, BTH_LEN, Bth, ICRC_LEN, IPV4_HEADER_LEN, NakCode, Opcode, PacketRef,
     PacketSpec, RETH_LEN, Reth, SegmentPosition, UDP_HEADER_LEN,
@@ -36,7 +39,9 @@ pub struct RcEndpointConfig {
     pub maximum_packet_size: usize,
     /// Frequency of the monotonic tick value supplied to [`RcEndpoint::progress`].
     pub ticks_per_second: u64,
-    /// Per-endpoint seed used to diversify lkeys and rkeys.
+    /// Deterministic development seed for registrations made without a key generator.
+    ///
+    /// Production code should use `RcEndpoint::register_memory_with_key_generator`.
     pub memory_key_seed: u32,
 }
 
@@ -86,10 +91,14 @@ pub struct RcEndpointStats {
     pub transmit_bytes: u64,
     /// Packets rejected by strict IPv4/UDP/transport/ICRC validation.
     pub invalid_packets: u64,
+    /// Packets consumed and intentionally dropped as invalid or unrelated traffic.
+    pub dropped_packets: u64,
     /// Valid packets addressed to an unknown QPN.
     pub unknown_qp_packets: u64,
     /// Valid packets received from an address other than the connected peer.
     pub peer_mismatch_packets: u64,
+    /// Valid packets for a QP that is not currently able to receive.
+    pub qp_not_ready_packets: u64,
     /// Packet-backend failures.
     pub io_errors: u64,
     /// Send-queue work requests accepted from the application.
@@ -136,6 +145,13 @@ impl RcProgress {
             || self.completions != 0
             || self.retransmissions != 0
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReceiveOne<'a> {
+    Empty,
+    Dropped,
+    Packet(DecodedPacket<'a>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -209,6 +225,42 @@ struct ReadResponseState {
 }
 
 #[derive(Debug)]
+struct PostedWork<T> {
+    work: T,
+    lease: Option<RegionLease>,
+}
+
+fn release_lease<const MRS: usize>(
+    memory: &mut MemoryRegistry<'_, MRS>,
+    lease: &mut Option<RegionLease>,
+) {
+    let result = memory.release(lease);
+    debug_assert!(
+        result.is_ok(),
+        "endpoint owns only leases from its registry"
+    );
+}
+
+fn retain_batch<const MRS: usize, const B: usize>(
+    memory: &mut MemoryRegistry<'_, MRS>,
+    keys: impl Iterator<Item = u32>,
+) -> Result<[Option<RegionLease>; B], ApiError> {
+    let mut leases = core::array::from_fn(|_| None);
+    for (index, key) in keys.enumerate() {
+        match memory.retain_local(key) {
+            Ok(lease) => leases[index] = Some(lease),
+            Err(error) => {
+                for lease in &mut leases {
+                    release_lease(memory, lease);
+                }
+                return Err(error.into());
+            }
+        }
+    }
+    Ok(leases)
+}
+
+#[derive(Debug)]
 struct RcQpSlot<const SQ: usize, const RQ: usize, const CQ: usize> {
     generation: u32,
     machine: QpStateMachine,
@@ -216,11 +268,14 @@ struct RcQpSlot<const SQ: usize, const RQ: usize, const CQ: usize> {
     rnr_nak_timer: u8,
     send_window: SendWindow,
     receive_psn: ReceivePsn,
-    send_queue: Ring<WorkRequest, SQ>,
-    receive_queue: Ring<RecvWorkRequest, RQ>,
+    send_queue: Ring<PostedWork<WorkRequest>, SQ>,
+    receive_queue: Ring<PostedWork<RecvWorkRequest>, RQ>,
     completion_queue: Ring<Completion, CQ>,
     completion_reservations: usize,
     active_request: Option<ActiveRequest>,
+    active_memory: Option<RegionLease>,
+    inbound_memory: Option<RegionLease>,
+    read_memory: Option<RegionLease>,
     inbound_message: Option<InboundMessage>,
     read_response: Option<ReadResponseState>,
     read_replay: Option<ReadResponseState>,
@@ -244,6 +299,9 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
             completion_queue: Ring::new(),
             completion_reservations: 0,
             active_request: None,
+            active_memory: None,
+            inbound_memory: None,
+            read_memory: None,
             inbound_message: None,
             read_response: None,
             read_replay: None,
@@ -290,7 +348,13 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
         }
     }
 
-    fn finish_active(&mut self, status: CompletionStatus, byte_len: u32) -> usize {
+    fn finish_active<const MRS: usize>(
+        &mut self,
+        memory: &mut MemoryRegistry<'_, MRS>,
+        status: CompletionStatus,
+        byte_len: u32,
+    ) -> usize {
+        release_lease(memory, &mut self.active_memory);
         let Some(active) = self.active_request.take() else {
             return 0;
         };
@@ -306,12 +370,14 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
         self.resolve_reserved_completion(completion)
     }
 
-    fn finish_receive(
+    fn finish_receive<const MRS: usize>(
         &mut self,
+        memory: &mut MemoryRegistry<'_, MRS>,
         work: RecvWorkRequest,
         status: CompletionStatus,
         byte_len: u32,
     ) -> usize {
+        release_lease(memory, &mut self.inbound_memory);
         let completion = if matches!(status, CompletionStatus::Success) {
             Completion::success(work.id, CompletionOpcode::Receive, byte_len)
         } else {
@@ -320,19 +386,23 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
         self.resolve_reserved_completion(Some(completion))
     }
 
-    fn flush_pending(&mut self) -> usize {
+    fn flush_pending<const MRS: usize>(&mut self, memory: &mut MemoryRegistry<'_, MRS>) -> usize {
         let mut generated = 0;
-        generated += self.finish_active(CompletionStatus::Flushed, 0);
+        generated += self.finish_active(memory, CompletionStatus::Flushed, 0);
 
         if let Some(InboundMessage::Send { work, .. }) = self.inbound_message.take() {
-            generated += self.finish_receive(work, CompletionStatus::Flushed, 0);
+            generated += self.finish_receive(memory, work, CompletionStatus::Flushed, 0);
         } else {
             self.inbound_message = None;
         }
+        release_lease(memory, &mut self.inbound_memory);
+        release_lease(memory, &mut self.read_memory);
         self.read_response = None;
         self.read_replay = None;
 
-        while let Some(work) = self.send_queue.pop() {
+        while let Some(mut posted) = self.send_queue.pop() {
+            release_lease(memory, &mut posted.lease);
+            let work = posted.work;
             let opcode = match work.kind {
                 WorkRequestKind::Send => CompletionOpcode::Send,
                 WorkRequestKind::RdmaWrite { .. } => CompletionOpcode::RdmaWrite,
@@ -344,18 +414,19 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
                 CompletionStatus::Flushed,
             )));
         }
-        while let Some(work) = self.receive_queue.pop() {
-            generated += self.finish_receive(work, CompletionStatus::Flushed, 0);
+        while let Some(mut posted) = self.receive_queue.pop() {
+            release_lease(memory, &mut posted.lease);
+            generated += self.finish_receive(memory, posted.work, CompletionStatus::Flushed, 0);
         }
         generated
     }
 
-    fn enter_error(&mut self) -> usize {
+    fn enter_error<const MRS: usize>(&mut self, memory: &mut MemoryRegistry<'_, MRS>) -> usize {
         if !matches!(self.machine.state(), QpState::Error) {
             let transition = self.machine.transition(QpState::Error);
             debug_assert!(transition.is_ok());
         }
-        self.flush_pending()
+        self.flush_pending(memory)
     }
 
     fn is_busy(&self) -> bool {
@@ -427,12 +498,27 @@ struct ReadyReadResponse {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum PreparedPayload {
+    Empty,
+    Local {
+        lkey: u32,
+        address: u64,
+        length: usize,
+    },
+    Remote {
+        rkey: u32,
+        address: u64,
+        length: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
 struct PreparedWirePacket {
     path: Ipv4Path,
     bth: Bth,
     reth: Option<Reth>,
     aeth: Option<Aeth>,
-    payload_length: usize,
+    payload: PreparedPayload,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -606,12 +692,16 @@ where
         &self.memory
     }
 
-    /// Mutably borrow the checked registered-memory table.
-    pub fn memory_registry_mut(&mut self) -> &mut MemoryRegistry<'memory, MRS> {
-        &mut self.memory
+    /// Borrow checked copy operations without allowing registry replacement.
+    pub fn memory_registry_mut(&mut self) -> MemoryAccess<'_, 'memory, MRS> {
+        self.memory.access()
     }
 
-    /// Register an exclusive application buffer.
+    /// Register an exclusive application buffer with deterministic development keys.
+    ///
+    /// This path is reproducible and is intended for tests and controlled development.
+    /// Production code should use [`Self::register_memory_with_key_generator`] with an
+    /// externally seeded cryptographic key source.
     pub fn register_memory(
         &mut self,
         memory: &'memory mut [u8],
@@ -620,11 +710,22 @@ where
         Ok(self.memory.register(memory, access)?)
     }
 
+    /// Register with an external production key source instead of the development seed.
+    pub fn register_memory_with_key_generator(
+        &mut self,
+        memory: &'memory mut [u8],
+        access: AccessFlags,
+        generator: &mut impl KeyGenerator,
+    ) -> Result<RegionHandle, ApiError> {
+        Ok(self
+            .memory
+            .register_with_key_generator(memory, access, generator)?)
+    }
+
     /// Remove a memory registration and return its original exclusive slice.
     ///
-    /// The caller must ensure no posted WQE still references the region. If a
-    /// stale key is encountered later, the affected QP completes with a local
-    /// protection error rather than dereferencing the stale region.
+    /// Returns `MemoryError::RegionBusy` while posted or active work references
+    /// the region. Success, failure, and QP flush release references exactly once.
     pub fn deregister_memory(
         &mut self,
         handle: RegionHandle,
@@ -744,10 +845,10 @@ where
             let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
             if matches!(destination, QpState::Error) {
                 slot.machine.transition(destination)?;
-                slot.flush_pending()
+                slot.flush_pending(&mut self.memory)
             } else if matches!(destination, QpState::Reset) {
                 slot.machine.transition(destination)?;
-                let completions = slot.flush_pending();
+                let completions = slot.flush_pending(&mut self.memory);
                 slot.reset_transport_state();
                 completions
             } else {
@@ -782,11 +883,18 @@ where
                 return Err(ApiError::QueueFull(QueueKind::Send));
             }
             slot.reserve_completion()?;
-            if let Err(error) = slot.send_queue.push(work) {
+            let lease = match self.memory.retain_local(work.sge.lkey) {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    slot.completion_reservations -= 1;
+                    return Err(error.into());
+                }
+            };
+            if let Err(error) = slot.send_queue.push(PostedWork { work, lease }) {
+                let mut posted = error.into_inner();
+                release_lease(&mut self.memory, &mut posted.lease);
                 slot.completion_reservations = slot.completion_reservations.saturating_sub(1);
-                return Err(ApiError::QueueFull(match error {
-                    rocev2_core::PushError::Full(_) => QueueKind::Send,
-                }));
+                return Err(ApiError::QueueFull(QueueKind::Send));
             }
         }
         self.synchronize_qp(index);
@@ -833,10 +941,12 @@ where
             validate_posted_work(&self.memory, *work, mtu)?;
         }
 
+        let leases =
+            retain_batch::<MRS, SQ>(&mut self.memory, works.iter().map(|work| work.sge.lkey))?;
         let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
         slot.completion_reservations += works.len();
-        for work in works {
-            let pushed = slot.send_queue.push(*work);
+        for (work, lease) in works.iter().zip(leases) {
+            let pushed = slot.send_queue.push(PostedWork { work: *work, lease });
             debug_assert!(pushed.is_ok());
         }
         self.synchronize_qp(index);
@@ -874,11 +984,18 @@ where
             return Err(ApiError::QueueFull(QueueKind::Receive));
         }
         slot.reserve_completion()?;
-        if let Err(error) = slot.receive_queue.push(work) {
+        let lease = match self.memory.retain_local(work.sge.lkey) {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                slot.completion_reservations -= 1;
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = slot.receive_queue.push(PostedWork { work, lease }) {
+            let mut posted = error.into_inner();
+            release_lease(&mut self.memory, &mut posted.lease);
             slot.completion_reservations = slot.completion_reservations.saturating_sub(1);
-            return Err(ApiError::QueueFull(match error {
-                rocev2_core::PushError::Full(_) => QueueKind::Receive,
-            }));
+            return Err(ApiError::QueueFull(QueueKind::Receive));
         }
         self.stats.posted_receive_requests = self.stats.posted_receive_requests.saturating_add(1);
         Ok(())
@@ -927,10 +1044,12 @@ where
                 .validate_local_write(work.sge.lkey, work.sge.address, length)?;
         }
 
+        let leases =
+            retain_batch::<MRS, RQ>(&mut self.memory, works.iter().map(|work| work.sge.lkey))?;
         let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
         slot.completion_reservations += works.len();
-        for work in works {
-            let pushed = slot.receive_queue.push(*work);
+        for (work, lease) in works.iter().zip(leases) {
+            let pushed = slot.receive_queue.push(PostedWork { work: *work, lease });
             debug_assert!(pushed.is_ok());
         }
         self.stats.posted_receive_requests = self
@@ -992,17 +1111,24 @@ where
             return Ok(progress);
         }
 
-        if let Some(decoded) = self.receive_one(receive_buffer)? {
-            progress.received_packets = 1;
-            let result = self.process_incoming(now, decoded)?;
-            progress.completions += result.completions;
-            progress.retransmissions += result.retransmissions;
-            if let Some(reply) = result.reply {
-                let queued = self.pending_control.push(reply);
-                debug_assert!(queued.is_ok());
-                if self.transmit_pending_control(transmit_buffer)? {
-                    progress.transmitted_packets = 1;
-                    return Ok(progress);
+        match self.receive_one(receive_buffer)? {
+            ReceiveOne::Empty => {}
+            ReceiveOne::Dropped => {
+                progress.received_packets = 1;
+            }
+            ReceiveOne::Packet(decoded) => {
+                progress.received_packets = 1;
+                if let Some(result) = self.process_incoming(now, decoded)? {
+                    progress.completions += result.completions;
+                    progress.retransmissions += result.retransmissions;
+                    if let Some(reply) = result.reply {
+                        let queued = self.pending_control.push(reply);
+                        debug_assert!(queued.is_ok());
+                        if self.transmit_pending_control(transmit_buffer)? {
+                            progress.transmitted_packets = 1;
+                            return Ok(progress);
+                        }
+                    }
                 }
             }
         }
@@ -1072,45 +1198,46 @@ where
     fn receive_one<'buffer>(
         &mut self,
         buffer: &'buffer mut [u8],
-    ) -> Result<Option<DecodedPacket<'buffer>>, PollError<Io::Error>> {
+    ) -> Result<ReceiveOne<'buffer>, PollError<Io::Error>> {
         let length = match self.io.receive_ipv4(buffer) {
             Ok(Some(length)) => length,
-            Ok(None) => return Ok(None),
+            Ok(None) => return Ok(ReceiveOne::Empty),
             Err(error) => {
                 self.stats.io_errors = self.stats.io_errors.saturating_add(1);
                 return Err(PollError::Io(error));
             }
         };
-        if length > self.config.maximum_packet_size || length > buffer.len() {
-            self.stats.invalid_packets = self.stats.invalid_packets.saturating_add(1);
-            return Err(ApiError::PacketTooLarge {
-                length,
-                maximum: self.config.maximum_packet_size.min(buffer.len()),
-            }
-            .into());
+        if length > buffer.len() {
+            return Err(ApiError::PacketIoContractViolation.into());
+        }
+        if length > self.config.maximum_packet_size {
+            self.record_invalid_drop();
+            return Ok(ReceiveOne::Dropped);
         }
 
-        let decoded = match decode_ipv4_packet(&buffer[..length]) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                self.stats.invalid_packets = self.stats.invalid_packets.saturating_add(1);
-                return Err(PollError::Api(error));
-            }
+        let Ok(decoded) = decode_ipv4_packet(&buffer[..length]) else {
+            self.record_invalid_drop();
+            return Ok(ReceiveOne::Dropped);
         };
         self.stats.receive_packets = self.stats.receive_packets.saturating_add(1);
         self.stats.receive_bytes = self
             .stats
             .receive_bytes
             .saturating_add(u64::try_from(length).unwrap_or(u64::MAX));
-        Ok(Some(decoded))
+        Ok(ReceiveOne::Packet(decoded))
+    }
+
+    fn record_invalid_drop(&mut self) {
+        self.stats.invalid_packets = self.stats.invalid_packets.saturating_add(1);
+        self.stats.dropped_packets = self.stats.dropped_packets.saturating_add(1);
     }
 
     fn process_incoming(
         &mut self,
         now: u64,
         decoded: DecodedPacket<'_>,
-    ) -> Result<HandlerResult, ApiError> {
-        let (index, result) = process_incoming_state(
+    ) -> Result<Option<HandlerResult>, ApiError> {
+        let state = process_incoming_state(
             &self.qpn_index,
             &mut self.qps,
             &mut self.memory,
@@ -1118,13 +1245,22 @@ where
             self.config.ticks_per_second,
             now,
             decoded,
-        )?;
+        );
+        let (index, result) = match state {
+            Ok(value) => value,
+            Err(
+                ApiError::UnknownDestinationQpn(_)
+                | ApiError::PeerAddressMismatch { .. }
+                | ApiError::QpNotReady(_),
+            ) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         self.synchronize_qp(index);
         self.stats.completions = self
             .stats
             .completions
             .saturating_add(u64::try_from(result.completions).unwrap_or(u64::MAX));
-        Ok(result)
+        Ok(Some(result))
     }
 
     fn transmit_pending_control(
@@ -1209,7 +1345,7 @@ where
             match action {
                 RequestPhase::Waiting => {
                     self.stats.timeout_events = self.stats.timeout_events.saturating_add(1);
-                    let retry = schedule_transport_retry(slot, &mut self.stats);
+                    let retry = schedule_transport_retry(slot, &mut self.memory, &mut self.stats);
                     result.completions += retry.completions;
                     result.retransmissions += retry.retransmissions;
                 }
@@ -1337,7 +1473,7 @@ where
             .qps
             .get_mut(index)
             .and_then(Option::as_mut)
-            .map_or(0, |slot| slot.enter_error());
+            .map_or(0, |slot| slot.enter_error(&mut self.memory));
         self.synchronize_qp(index);
         self.stats.completions = self
             .stats
@@ -1359,6 +1495,7 @@ where
             active.next_packet += 1;
             if active.next_packet == active.packet_count {
                 slot.read_response = None;
+                release_lease(&mut self.memory, &mut slot.read_memory);
             }
         }
         self.synchronize_qp(index);
@@ -1410,6 +1547,7 @@ where
                 Err(RequestPacketError::LocalProtection) => {
                     generated += fail_active_and_error(
                         self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?,
+                        &mut self.memory,
                         CompletionStatus::LocalProtectionError,
                     );
                     self.synchronize_qp(index);
@@ -1482,12 +1620,12 @@ where
             let path = slot.path;
             let timeout_ticks = ack_timeout_ticks(config.timeout, self.config.ticks_per_second)
                 .ok_or(ApiError::InvalidTicksPerSecond)?;
-            let packet = match build_request_packet(
-                &mut self.memory,
-                &mut self.payload_scratch,
+            let prepared = match prepare_request_batch_packet(
+                &self.memory,
                 active,
                 config.path_mtu.bytes(),
                 config.remote_qpn,
+                path,
             ) {
                 Ok(packet) => packet,
                 Err(RequestPacketError::ArithmeticOverflow) => {
@@ -1501,18 +1639,12 @@ where
                 Err(RequestPacketError::LocalProtection) => {
                     generated += fail_active_and_error(
                         self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?,
+                        &mut self.memory,
                         CompletionStatus::LocalProtectionError,
                     );
                     self.synchronize_qp(index);
                     continue;
                 }
-            };
-            let prepared = PreparedWirePacket {
-                path,
-                bth: packet.bth,
-                reth: packet.reth,
-                aeth: packet.aeth,
-                payload_length: packet.payload.len(),
             };
             self.stats.completions = self
                 .stats
@@ -1556,11 +1688,7 @@ where
             };
             if self
                 .memory
-                .read_remote(
-                    ready.response.rkey,
-                    address,
-                    &mut self.payload_scratch[..payload_length],
-                )
+                .validate_remote_read(ready.response.rkey, address, payload_length)
                 .is_err()
             {
                 let failed = self.fail_read_responder(ready.qp_index);
@@ -1590,7 +1718,11 @@ where
                         aeth: opcode
                             .has_aeth()
                             .then(|| Aeth::ack(ready.message_sequence_number.value())),
-                        payload_length,
+                        payload: PreparedPayload::Remote {
+                            rkey: ready.response.rkey,
+                            address,
+                            length: payload_length,
+                        },
                     },
                     PreparedTx::Responder {
                         qp_index: ready.qp_index,
@@ -1859,24 +1991,14 @@ where
                     break;
                 }
             };
+            progress.received_packets = progress.received_packets.saturating_add(1);
             if packet.len() > self.config.maximum_packet_size {
-                self.stats.invalid_packets = self.stats.invalid_packets.saturating_add(1);
-                processing_error = Some(
-                    ApiError::PacketTooLarge {
-                        length: packet.len(),
-                        maximum: self.config.maximum_packet_size,
-                    }
-                    .into(),
-                );
-                break;
+                self.record_invalid_drop();
+                continue;
             }
-            let decoded = match decode_ipv4_packet(packet) {
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    self.stats.invalid_packets = self.stats.invalid_packets.saturating_add(1);
-                    processing_error = Some(PollError::Api(error));
-                    break;
-                }
+            let Ok(decoded) = decode_ipv4_packet(packet) else {
+                self.record_invalid_drop();
+                continue;
             };
             let packet_length = packet.len();
             self.stats.receive_packets = self.stats.receive_packets.saturating_add(1);
@@ -1896,6 +2018,11 @@ where
             );
             let (index, result) = match state_result {
                 Ok(result) => result,
+                Err(
+                    ApiError::UnknownDestinationQpn(_)
+                    | ApiError::PeerAddressMismatch { .. }
+                    | ApiError::QpNotReady(_),
+                ) => continue,
                 Err(error) => {
                     processing_error = Some(PollError::Api(error));
                     break;
@@ -1906,7 +2033,6 @@ where
                 .stats
                 .completions
                 .saturating_add(u64::try_from(result.completions).unwrap_or(u64::MAX));
-            progress.received_packets = progress.received_packets.saturating_add(1);
             progress.completions = progress.completions.saturating_add(result.completions);
             progress.retransmissions = progress
                 .retransmissions
@@ -2189,7 +2315,25 @@ where
         prepared: PreparedWirePacket,
     ) -> Result<usize, PollError<Io::Error>> {
         let maximum_packet_size = self.config.maximum_packet_size;
-        let payload = &self.payload_scratch[..prepared.payload_length];
+        let payload = match prepared.payload {
+            PreparedPayload::Empty => &[],
+            PreparedPayload::Local {
+                lkey,
+                address,
+                length,
+            } => self
+                .memory
+                .local_read_slice(lkey, address, length)
+                .map_err(|error| PollError::Api(error.into()))?,
+            PreparedPayload::Remote {
+                rkey,
+                address,
+                length,
+            } => self
+                .memory
+                .remote_read_slice(rkey, address, length)
+                .map_err(|error| PollError::Api(error.into()))?,
+        };
         let output = match self.io.tx_ipv4_buffer(frame) {
             Ok(output) => output,
             Err(error) => {
@@ -2229,7 +2373,7 @@ fn prepared_control_packet(reply: ControlReply) -> PreparedWirePacket {
         ),
         reth: None,
         aeth: Some(reply.aeth),
-        payload_length: 0,
+        payload: PreparedPayload::Empty,
     }
 }
 
@@ -2252,6 +2396,7 @@ fn process_incoming_state<
     let destination_qpn = decoded.transport.bth.destination_qpn;
     let Some(index) = qpn_slot(qpn_index, destination_qpn) else {
         stats.unknown_qp_packets = stats.unknown_qp_packets.saturating_add(1);
+        stats.dropped_packets = stats.dropped_packets.saturating_add(1);
         return Err(ApiError::UnknownDestinationQpn(destination_qpn));
     };
 
@@ -2262,12 +2407,15 @@ fn process_incoming_state<
     if decoded.ipv4.source != slot.path.destination || decoded.ipv4.destination != slot.path.source
     {
         stats.peer_mismatch_packets = stats.peer_mismatch_packets.saturating_add(1);
+        stats.dropped_packets = stats.dropped_packets.saturating_add(1);
         return Err(ApiError::PeerAddressMismatch {
             source: decoded.ipv4.source,
             destination: decoded.ipv4.destination,
         });
     }
     if !slot.machine.can_receive() {
+        stats.qp_not_ready_packets = stats.qp_not_ready_packets.saturating_add(1);
+        stats.dropped_packets = stats.dropped_packets.saturating_add(1);
         return Err(ApiError::QpNotReady(slot.machine.state()));
     }
 
@@ -2410,7 +2558,7 @@ fn start_next_request<const SQ: usize, const RQ: usize, const CQ: usize>(
     if slot.active_request.is_some() || !slot.machine.can_send() {
         return;
     }
-    let Some(work) = slot.send_queue.front().copied() else {
+    let Some(work) = slot.send_queue.front().map(|posted| posted.work) else {
         return;
     };
     let config = slot.machine.config();
@@ -2421,8 +2569,11 @@ fn start_next_request<const SQ: usize, const RQ: usize, const CQ: usize>(
     let timeout_ticks = ack_timeout_ticks(config.timeout, ticks_per_second).unwrap_or(u64::MAX);
     let policy = RetryPolicy::new(config.retry_count, config.rnr_retry_count, timeout_ticks)
         .expect("validated QP retry counts");
-    let removed = slot.send_queue.pop();
-    debug_assert_eq!(removed, Some(work));
+    let Some(posted) = slot.send_queue.pop() else {
+        return;
+    };
+    debug_assert_eq!(posted.work, work);
+    slot.active_memory = posted.lease;
     slot.active_request = Some(ActiveRequest {
         work,
         first_psn,
@@ -2579,6 +2730,109 @@ fn build_request_packet<'packet, const MRS: usize>(
     })
 }
 
+fn prepare_request_batch_packet<const MRS: usize>(
+    memory: &MemoryRegistry<'_, MRS>,
+    active: ActiveRequest,
+    mtu: usize,
+    remote_qpn: u32,
+    path: Ipv4Path,
+) -> Result<PreparedWirePacket, RequestPacketError> {
+    match active.work.kind {
+        WorkRequestKind::Send => prepare_segmented_batch_packet(
+            memory,
+            active,
+            mtu,
+            remote_qpn,
+            path,
+            TransferDirection::Send,
+            None,
+        ),
+        WorkRequestKind::RdmaWrite {
+            remote_address,
+            rkey,
+        } => prepare_segmented_batch_packet(
+            memory,
+            active,
+            mtu,
+            remote_qpn,
+            path,
+            TransferDirection::Write,
+            Some((remote_address, rkey)),
+        ),
+        WorkRequestKind::RdmaRead {
+            remote_address,
+            rkey,
+        } => {
+            let mut bth = Bth::new(
+                Opcode::RdmaReadRequest,
+                remote_qpn,
+                active.first_psn.value(),
+            );
+            bth.ack_request = true;
+            Ok(PreparedWirePacket {
+                path,
+                bth,
+                reth: Some(Reth {
+                    virtual_address: remote_address,
+                    remote_key: rkey,
+                    dma_length: active.work.sge.length,
+                }),
+                aeth: None,
+                payload: PreparedPayload::Empty,
+            })
+        }
+    }
+}
+
+fn prepare_segmented_batch_packet<const MRS: usize>(
+    memory: &MemoryRegistry<'_, MRS>,
+    active: ActiveRequest,
+    mtu: usize,
+    remote_qpn: u32,
+    path: Ipv4Path,
+    direction: TransferDirection,
+    remote: Option<(u64, u32)>,
+) -> Result<PreparedWirePacket, RequestPacketError> {
+    let (offset, length) = segment_bounds(active.work.sge.length, mtu, active.next_packet)
+        .ok_or(RequestPacketError::ArithmeticOverflow)?;
+    let offset = u64::try_from(offset).map_err(|_| RequestPacketError::ArithmeticOverflow)?;
+    let address = active
+        .work
+        .sge
+        .address
+        .checked_add(offset)
+        .ok_or(RequestPacketError::ArithmeticOverflow)?;
+    memory
+        .validate_local_read(active.work.sge.lkey, address, length)
+        .map_err(|_| RequestPacketError::LocalProtection)?;
+
+    let opcode = segmented_opcode(direction, active.next_packet, active.packet_count);
+    let mut bth = Bth::new(
+        opcode,
+        remote_qpn,
+        active.first_psn.wrapping_add(active.next_packet).value(),
+    );
+    bth.ack_request = active.next_packet + 1 == active.packet_count;
+    let reth = remote.and_then(|(remote_address, rkey)| {
+        (active.next_packet == 0).then_some(Reth {
+            virtual_address: remote_address,
+            remote_key: rkey,
+            dma_length: active.work.sge.length,
+        })
+    });
+    Ok(PreparedWirePacket {
+        path,
+        bth,
+        reth,
+        aeth: None,
+        payload: PreparedPayload::Local {
+            lkey: active.work.sge.lkey,
+            address,
+            length,
+        },
+    })
+}
+
 fn mark_request_packet_sent<const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
     now: u64,
@@ -2637,7 +2891,7 @@ fn handle_request_packet<const MRS: usize, const SQ: usize, const RQ: usize, con
     }
 
     if packet.bth.partition_key != Bth::DEFAULT_PKEY {
-        return fatal_request_error(slot, received_psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, received_psn, Aeth::NAK_INVALID_REQUEST);
     }
 
     match packet.bth.opcode {
@@ -2657,18 +2911,20 @@ fn handle_request_packet<const MRS: usize, const SQ: usize, const RQ: usize, con
         | Opcode::RdmaReadResponseMiddle
         | Opcode::RdmaReadResponseLast
         | Opcode::RdmaReadResponseOnly
-        | Opcode::Acknowledge => fatal_request_error(slot, received_psn, Aeth::NAK_INVALID_REQUEST),
+        | Opcode::Acknowledge => {
+            fatal_request_error(slot, memory, received_psn, Aeth::NAK_INVALID_REQUEST)
+        }
     }
 }
 
 fn replay_read_request<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
-    memory: &MemoryRegistry<'_, MRS>,
+    memory: &mut MemoryRegistry<'_, MRS>,
     packet: PacketRef<'_>,
     psn: Psn,
 ) -> HandlerResult {
     let Some(reth) = packet.reth else {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     };
     let replay = ReadResponseState {
         request_psn: psn,
@@ -2686,7 +2942,7 @@ fn replay_read_request<const MRS: usize, const SQ: usize, const RQ: usize, const
         )
         .is_err()
     {
-        return fatal_request_error(slot, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
     }
 
     if slot.read_replay != Some(replay)
@@ -2704,6 +2960,12 @@ fn replay_read_request<const MRS: usize, const SQ: usize, const RQ: usize, const
         };
     }
 
+    if slot.read_memory.is_none() {
+        match memory.retain_remote(replay.rkey) {
+            Ok(lease) => slot.read_memory = Some(lease),
+            Err(_) => return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR),
+        }
+    }
     slot.read_response = Some(replay);
     HandlerResult::default()
 }
@@ -2717,7 +2979,7 @@ fn handle_send_request<const MRS: usize, const SQ: usize, const RQ: usize, const
     let position = packet.bth.opcode.position();
     let mtu = slot.machine.config().path_mtu.bytes();
     if !valid_request_payload_length(position, packet.payload.len(), mtu) {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     }
 
     match position {
@@ -2738,9 +3000,9 @@ fn handle_send_start<const MRS: usize, const SQ: usize, const RQ: usize, const C
     position: SegmentPosition,
 ) -> HandlerResult {
     if slot.inbound_message.is_some() {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     }
-    let Some(work) = slot.receive_queue.pop() else {
+    let Some(posted) = slot.receive_queue.pop() else {
         return HandlerResult {
             reply: Some(control_reply(
                 slot,
@@ -2750,17 +3012,21 @@ fn handle_send_start<const MRS: usize, const SQ: usize, const RQ: usize, const C
             ..HandlerResult::default()
         };
     };
+    let work = posted.work;
+    slot.inbound_memory = posted.lease;
     if packet.payload.len() > usize::try_from(work.sge.length).unwrap_or(usize::MAX) {
-        let mut result = fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
-        result.completions += slot.finish_receive(work, CompletionStatus::LocalLengthError, 0);
+        let mut result = fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
+        result.completions +=
+            slot.finish_receive(memory, work, CompletionStatus::LocalLengthError, 0);
         return result;
     }
     if memory
         .write_local(work.sge.lkey, work.sge.address, packet.payload)
         .is_err()
     {
-        let mut result = fatal_request_error(slot, psn, Aeth::NAK_REMOTE_OPERATION_ERROR);
-        result.completions += slot.finish_receive(work, CompletionStatus::LocalProtectionError, 0);
+        let mut result = fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_OPERATION_ERROR);
+        result.completions +=
+            slot.finish_receive(memory, work, CompletionStatus::LocalProtectionError, 0);
         return result;
     }
 
@@ -2768,7 +3034,8 @@ fn handle_send_start<const MRS: usize, const SQ: usize, const RQ: usize, const C
     slot.receive_psn.observe(psn);
     if matches!(position, SegmentPosition::Only) {
         slot.message_sequence_number = slot.message_sequence_number.next();
-        let completions = slot.finish_receive(work, CompletionStatus::Success, bytes_written);
+        let completions =
+            slot.finish_receive(memory, work, CompletionStatus::Success, bytes_written);
         HandlerResult {
             reply: Some(ack_reply(slot, psn)),
             completions,
@@ -2798,31 +3065,31 @@ fn handle_send_continuation<const MRS: usize, const SQ: usize, const RQ: usize, 
         bytes_written,
     }) = slot.inbound_message
     else {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     };
     let Some(new_total) =
         bytes_written.checked_add(u32::try_from(packet.payload.len()).unwrap_or(u32::MAX))
     else {
-        return fail_receive_message(slot, psn, CompletionStatus::LocalLengthError);
+        return fail_receive_message(slot, memory, psn, CompletionStatus::LocalLengthError);
     };
     if new_total > work.sge.length {
-        return fail_receive_message(slot, psn, CompletionStatus::LocalLengthError);
+        return fail_receive_message(slot, memory, psn, CompletionStatus::LocalLengthError);
     }
     let Some(address) = work.sge.address.checked_add(u64::from(bytes_written)) else {
-        return fail_receive_message(slot, psn, CompletionStatus::LocalLengthError);
+        return fail_receive_message(slot, memory, psn, CompletionStatus::LocalLengthError);
     };
     if memory
         .write_local(work.sge.lkey, address, packet.payload)
         .is_err()
     {
-        return fail_receive_message(slot, psn, CompletionStatus::LocalProtectionError);
+        return fail_receive_message(slot, memory, psn, CompletionStatus::LocalProtectionError);
     }
 
     slot.receive_psn.observe(psn);
     if matches!(position, SegmentPosition::Last) {
         slot.inbound_message = None;
         slot.message_sequence_number = slot.message_sequence_number.next();
-        let completions = slot.finish_receive(work, CompletionStatus::Success, new_total);
+        let completions = slot.finish_receive(memory, work, CompletionStatus::Success, new_total);
         HandlerResult {
             reply: Some(ack_reply(slot, psn)),
             completions,
@@ -2849,7 +3116,7 @@ fn handle_write_request<const MRS: usize, const SQ: usize, const RQ: usize, cons
     let position = packet.bth.opcode.position();
     let mtu = slot.machine.config().path_mtu.bytes();
     if !valid_request_payload_length(position, packet.payload.len(), mtu) {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     }
 
     match position {
@@ -2870,10 +3137,10 @@ fn handle_write_start<const MRS: usize, const SQ: usize, const RQ: usize, const 
     position: SegmentPosition,
 ) -> HandlerResult {
     if slot.inbound_message.is_some() {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     }
     let Some(reth) = packet.reth else {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     };
     let payload_length = u32::try_from(packet.payload.len()).unwrap_or(u32::MAX);
     let length_is_valid = match position {
@@ -2882,7 +3149,7 @@ fn handle_write_start<const MRS: usize, const SQ: usize, const RQ: usize, const 
         SegmentPosition::Middle | SegmentPosition::Last => false,
     };
     if !length_is_valid {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     }
     if memory
         .validate_remote_write(
@@ -2891,11 +3158,21 @@ fn handle_write_start<const MRS: usize, const SQ: usize, const RQ: usize, const 
             usize::try_from(reth.dma_length).unwrap_or(usize::MAX),
         )
         .is_err()
-        || memory
-            .write_remote(reth.remote_key, reth.virtual_address, packet.payload)
-            .is_err()
     {
-        return fatal_request_error(slot, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
+    }
+
+    if matches!(position, SegmentPosition::First) {
+        match memory.retain_remote(reth.remote_key) {
+            Ok(lease) => slot.inbound_memory = Some(lease),
+            Err(_) => return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR),
+        }
+    }
+    if memory
+        .write_remote(reth.remote_key, reth.virtual_address, packet.payload)
+        .is_err()
+    {
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
     }
 
     slot.receive_psn.observe(psn);
@@ -2934,12 +3211,12 @@ fn handle_write_continuation<
         bytes_written,
     }) = slot.inbound_message
     else {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     };
     let Some(new_total) =
         bytes_written.checked_add(u32::try_from(packet.payload.len()).unwrap_or(u32::MAX))
     else {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     };
     let valid_position = match position {
         SegmentPosition::Middle => new_total < total_length,
@@ -2947,21 +3224,22 @@ fn handle_write_continuation<
         SegmentPosition::First | SegmentPosition::Only => false,
     };
     if !valid_position {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     }
     let Some(segment_address) = address.checked_add(u64::from(bytes_written)) else {
-        return fatal_request_error(slot, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
     };
     if memory
         .write_remote(rkey, segment_address, packet.payload)
         .is_err()
     {
-        return fatal_request_error(slot, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
     }
 
     slot.receive_psn.observe(psn);
     if matches!(position, SegmentPosition::Last) {
         slot.inbound_message = None;
+        release_lease(memory, &mut slot.inbound_memory);
         slot.message_sequence_number = slot.message_sequence_number.next();
     } else {
         slot.inbound_message = Some(InboundMessage::Write {
@@ -2984,7 +3262,7 @@ fn handle_read_request<const MRS: usize, const SQ: usize, const RQ: usize, const
     psn: Psn,
 ) -> HandlerResult {
     if slot.inbound_message.is_some() {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     }
     if slot.read_response.is_some() {
         return HandlerResult {
@@ -2997,7 +3275,7 @@ fn handle_read_request<const MRS: usize, const SQ: usize, const RQ: usize, const
         };
     }
     let Some(reth) = packet.reth else {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     };
     if memory
         .validate_remote_read(
@@ -3007,9 +3285,13 @@ fn handle_read_request<const MRS: usize, const SQ: usize, const RQ: usize, const
         )
         .is_err()
     {
-        return fatal_request_error(slot, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
     }
 
+    match memory.retain_remote(reth.remote_key) {
+        Ok(lease) => slot.read_memory = Some(lease),
+        Err(_) => return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR),
+    }
     let packets = packet_count(reth.dma_length, slot.machine.config().path_mtu.bytes());
     slot.receive_psn.observe_span(psn, packets);
     slot.message_sequence_number = slot.message_sequence_number.next();
@@ -3033,8 +3315,9 @@ fn valid_request_payload_length(position: SegmentPosition, length: usize, mtu: u
     }
 }
 
-fn fail_receive_message<const SQ: usize, const RQ: usize, const CQ: usize>(
+fn fail_receive_message<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &mut MemoryRegistry<'_, MRS>,
     psn: Psn,
     status: CompletionStatus,
 ) -> HandlerResult {
@@ -3043,8 +3326,8 @@ fn fail_receive_message<const SQ: usize, const RQ: usize, const CQ: usize>(
         Some(InboundMessage::Write { .. }) | None => None,
     };
     let reply = nak_reply(slot, psn, Aeth::NAK_INVALID_REQUEST);
-    let mut completions = work.map_or(0, |work| slot.finish_receive(work, status, 0));
-    completions += slot.enter_error();
+    let mut completions = work.map_or(0, |work| slot.finish_receive(memory, work, status, 0));
+    completions += slot.enter_error(memory);
     HandlerResult {
         reply: Some(reply),
         completions,
@@ -3052,13 +3335,14 @@ fn fail_receive_message<const SQ: usize, const RQ: usize, const CQ: usize>(
     }
 }
 
-fn fatal_request_error<const SQ: usize, const RQ: usize, const CQ: usize>(
+fn fatal_request_error<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &mut MemoryRegistry<'_, MRS>,
     psn: Psn,
     syndrome: u8,
 ) -> HandlerResult {
     let reply = nak_reply(slot, psn, syndrome);
-    let completions = slot.enter_error();
+    let completions = slot.enter_error(memory);
     HandlerResult {
         reply: Some(reply),
         completions,
@@ -3081,10 +3365,11 @@ fn handle_response_packet<const MRS: usize, const SQ: usize, const RQ: usize, co
     match packet.bth.opcode {
         Opcode::Acknowledge => {
             let Some(aeth) = packet.aeth else {
-                return fail_active_transport(slot);
+                return fail_active_transport(slot, memory);
             };
             handle_aeth_response(
                 slot,
+                memory,
                 aeth,
                 Psn::new_truncated(packet.bth.psn),
                 now,
@@ -3110,12 +3395,13 @@ fn handle_response_packet<const MRS: usize, const SQ: usize, const RQ: usize, co
         | Opcode::RdmaWriteLastWithImmediate
         | Opcode::RdmaWriteOnly
         | Opcode::RdmaWriteOnlyWithImmediate
-        | Opcode::RdmaReadRequest => fail_active_transport(slot),
+        | Opcode::RdmaReadRequest => fail_active_transport(slot, memory),
     }
 }
 
-fn handle_aeth_response<const SQ: usize, const RQ: usize, const CQ: usize>(
+fn handle_aeth_response<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &mut MemoryRegistry<'_, MRS>,
     aeth: Aeth,
     response_psn: Psn,
     now: u64,
@@ -3128,7 +3414,7 @@ fn handle_aeth_response<const SQ: usize, const RQ: usize, const CQ: usize>(
                 return HandlerResult::default();
             };
             if matches!(active.work.kind, WorkRequestKind::RdmaRead { .. }) {
-                return fail_active_transport(slot);
+                return fail_active_transport(slot, memory);
             }
             if active.transmitted_packets == 0
                 || matches!(
@@ -3140,7 +3426,7 @@ fn handle_aeth_response<const SQ: usize, const RQ: usize, const CQ: usize>(
                     rocev2_core::PsnOrdering::After
                 )
             {
-                return fail_active_transport(slot);
+                return fail_active_transport(slot, memory);
             }
             match slot.send_window.acknowledge(response_psn) {
                 AckAdvance::Advanced { .. } => {
@@ -3148,8 +3434,11 @@ fn handle_aeth_response<const SQ: usize, const RQ: usize, const CQ: usize>(
                         current.retry_budget.reset();
                     }
                     if slot.send_window.oldest_unacknowledged() == active.last_psn.next() {
-                        let completions =
-                            slot.finish_active(CompletionStatus::Success, active.work.sge.length);
+                        let completions = slot.finish_active(
+                            memory,
+                            CompletionStatus::Success,
+                            active.work.sge.length,
+                        );
                         HandlerResult {
                             reply: None,
                             completions,
@@ -3166,23 +3455,23 @@ fn handle_aeth_response<const SQ: usize, const RQ: usize, const CQ: usize>(
                     }
                 }
                 AckAdvance::Duplicate => HandlerResult::default(),
-                AckAdvance::Invalid => fail_active_transport(slot),
+                AckAdvance::Invalid => fail_active_transport(slot, memory),
             }
         }
         AethClass::RnrNak { timer } => {
             stats.rnr_naks = stats.rnr_naks.saturating_add(1);
-            schedule_rnr_retry(slot, timer, now, ticks_per_second, stats)
+            schedule_rnr_retry(slot, memory, timer, now, ticks_per_second, stats)
         }
-        AethClass::Nak(NakCode::PsnSequenceError) => schedule_transport_retry(slot, stats),
+        AethClass::Nak(NakCode::PsnSequenceError) => schedule_transport_retry(slot, memory, stats),
         AethClass::Nak(NakCode::InvalidRequest) => {
-            fail_active_and_enter_error(slot, CompletionStatus::RemoteInvalidRequest)
+            fail_active_and_enter_error(slot, memory, CompletionStatus::RemoteInvalidRequest)
         }
         AethClass::Nak(NakCode::RemoteAccessError) => {
-            fail_active_and_enter_error(slot, CompletionStatus::RemoteAccessError)
+            fail_active_and_enter_error(slot, memory, CompletionStatus::RemoteAccessError)
         }
         AethClass::Nak(NakCode::RemoteOperationError | NakCode::Unknown(_))
         | AethClass::Reserved { .. } => {
-            fail_active_and_enter_error(slot, CompletionStatus::TransportError)
+            fail_active_and_enter_error(slot, memory, CompletionStatus::TransportError)
         }
     }
 }
@@ -3199,13 +3488,14 @@ fn handle_read_response<const MRS: usize, const SQ: usize, const RQ: usize, cons
         return HandlerResult::default();
     };
     if !matches!(active.work.kind, WorkRequestKind::RdmaRead { .. }) {
-        return fail_active_transport(slot);
+        return fail_active_transport(slot, memory);
     }
 
     if let Some(aeth) = packet.aeth {
         if !matches!(aeth.class(), AethClass::Ack { .. }) {
             return handle_aeth_response(
                 slot,
+                memory,
                 aeth,
                 Psn::new_truncated(packet.bth.psn),
                 now,
@@ -3230,17 +3520,17 @@ fn handle_read_response<const MRS: usize, const SQ: usize, const RQ: usize, cons
         active.packet_count,
     );
     if packet.bth.opcode != expected_opcode {
-        return fail_active_transport(slot);
+        return fail_active_transport(slot, memory);
     }
     let Some((offset, expected_length)) = segment_bounds(
         active.work.sge.length,
         slot.machine.config().path_mtu.bytes(),
         active.read_packets_received,
     ) else {
-        return fail_active_transport(slot);
+        return fail_active_transport(slot, memory);
     };
     if packet.payload.len() != expected_length {
-        return fail_active_transport(slot);
+        return fail_active_transport(slot, memory);
     }
     let Some(local_address) = active
         .work
@@ -3248,13 +3538,13 @@ fn handle_read_response<const MRS: usize, const SQ: usize, const RQ: usize, cons
         .address
         .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
     else {
-        return fail_active_and_enter_error(slot, CompletionStatus::LocalLengthError);
+        return fail_active_and_enter_error(slot, memory, CompletionStatus::LocalLengthError);
     };
     if memory
         .write_local(active.work.sge.lkey, local_address, packet.payload)
         .is_err()
     {
-        return fail_active_and_enter_error(slot, CompletionStatus::LocalProtectionError);
+        return fail_active_and_enter_error(slot, memory, CompletionStatus::LocalProtectionError);
     }
 
     let _ack = slot.send_window.acknowledge(received_psn);
@@ -3274,7 +3564,7 @@ fn handle_read_response<const MRS: usize, const SQ: usize, const RQ: usize, cons
 
     if completed {
         let byte_len = active.work.sge.length;
-        let completions = slot.finish_active(CompletionStatus::Success, byte_len);
+        let completions = slot.finish_active(memory, CompletionStatus::Success, byte_len);
         HandlerResult {
             reply: None,
             completions,
@@ -3285,8 +3575,9 @@ fn handle_read_response<const MRS: usize, const SQ: usize, const RQ: usize, cons
     }
 }
 
-fn schedule_transport_retry<const SQ: usize, const RQ: usize, const CQ: usize>(
+fn schedule_transport_retry<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &mut MemoryRegistry<'_, MRS>,
     stats: &mut RcEndpointStats,
 ) -> HandlerResult {
     let Some(active) = slot.active_request.as_mut() else {
@@ -3303,13 +3594,14 @@ fn schedule_transport_retry<const SQ: usize, const RQ: usize, const CQ: usize>(
             }
         }
         RetryDecision::Exhausted { .. } => {
-            fail_active_and_enter_error(slot, CompletionStatus::RetryExceeded)
+            fail_active_and_enter_error(slot, memory, CompletionStatus::RetryExceeded)
         }
     }
 }
 
-fn schedule_rnr_retry<const SQ: usize, const RQ: usize, const CQ: usize>(
+fn schedule_rnr_retry<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &mut MemoryRegistry<'_, MRS>,
     timer_code: u8,
     now: u64,
     ticks_per_second: u64,
@@ -3329,22 +3621,29 @@ fn schedule_rnr_retry<const SQ: usize, const RQ: usize, const CQ: usize>(
             HandlerResult::default()
         }
         RetryDecision::Exhausted { .. } => {
-            fail_active_and_enter_error(slot, CompletionStatus::RnrRetryExceeded)
+            fail_active_and_enter_error(slot, memory, CompletionStatus::RnrRetryExceeded)
         }
     }
 }
 
-fn fail_active_transport<const SQ: usize, const RQ: usize, const CQ: usize>(
+fn fail_active_transport<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &mut MemoryRegistry<'_, MRS>,
 ) -> HandlerResult {
-    fail_active_and_enter_error(slot, CompletionStatus::TransportError)
+    fail_active_and_enter_error(slot, memory, CompletionStatus::TransportError)
 }
 
-fn fail_active_and_enter_error<const SQ: usize, const RQ: usize, const CQ: usize>(
+fn fail_active_and_enter_error<
+    const MRS: usize,
+    const SQ: usize,
+    const RQ: usize,
+    const CQ: usize,
+>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &mut MemoryRegistry<'_, MRS>,
     status: CompletionStatus,
 ) -> HandlerResult {
-    let completions = fail_active_and_error(slot, status);
+    let completions = fail_active_and_error(slot, memory, status);
     HandlerResult {
         reply: None,
         completions,
@@ -3352,11 +3651,12 @@ fn fail_active_and_enter_error<const SQ: usize, const RQ: usize, const CQ: usize
     }
 }
 
-fn fail_active_and_error<const SQ: usize, const RQ: usize, const CQ: usize>(
+fn fail_active_and_error<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &mut MemoryRegistry<'_, MRS>,
     status: CompletionStatus,
 ) -> usize {
-    let mut completions = slot.finish_active(status, 0);
-    completions += slot.enter_error();
+    let mut completions = slot.finish_active(memory, status, 0);
+    completions += slot.enter_error(memory);
     completions
 }

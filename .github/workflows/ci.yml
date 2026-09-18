@@ -38,9 +38,7 @@ jobs:
         with:
           targets: thumbv7em-none-eabihf
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p rocev2-wire --target thumbv7em-none-eabihf
-      - run: cargo check -p rocev2-core --target thumbv7em-none-eabihf
-      - run: cargo check -p rocev2-memory --target thumbv7em-none-eabihf
+      - run: cargo check --workspace --no-default-features --target thumbv7em-none-eabihf
 
   msrv:
     name: Rust 1.85

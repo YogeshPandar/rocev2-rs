@@ -11,11 +11,13 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["raw-ipv4"]
-raw-ipv4 = ["dep:libc"]
-afxdp = ["dep:libc"]
+default = ["std", "raw-ipv4"]
+std = []
+raw-ipv4 = ["std", "dep:libc"]
+afxdp = ["std", "dep:libc", "dep:aya-obj"]
 
 [dependencies]
+aya-obj = { version = "=0.2.1", default-features = false, optional = true }
 libc = { version = "0.2", optional = true }
 rocev2-wire = { path = "../rocev2-wire", version = "0.1.0" }
 

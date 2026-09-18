@@ -10,11 +10,11 @@ memory safety and operating-system I/O:
 - `rocev2-core`: `no_std` PSN arithmetic, QP transitions, segmentation, ACK
   windows, retry policy, fixed-capacity rings, local-QPN indexing, intrusive
   ready queues and indexed deadline scheduling.
-- `rocev2-memory`: registered-memory ownership, generation-tagged lkey/rkey,
-  permission/range/overflow checks and a two-function audited raw-pointer
-  boundary.
-- `rocev2-io`: complete-IPv4-packet I/O. MockIO is deterministic, raw IPv4 is
-  the correctness backend, and AF_XDP is the intended high-throughput backend.
+- `rocev2-memory`: registered-memory ownership, full-width lkey/rkey lookup,
+  posted-work leases, permission/range/overflow checks and a small audited
+  raw-pointer boundary.
+- `rocev2-io`: complete-IPv4-packet I/O, fixed-capacity fault injection, raw
+  IPv4 correctness I/O, AF_XDP, and native XDP/XSKMAP steering.
 - `rocev2`: endpoint/QP integration and the public API.
 
 ## Ownership model
@@ -59,7 +59,7 @@ registry. Network-supplied `(address, rkey, length)` is checked in this order:
 2. access permission;
 3. checked end-address arithmetic;
 4. containment in the registered region;
-5. copy through the audited raw module.
+5. copy through the audited raw module, or expose a checked immutable slice tied to the registry borrow.
 
 ## Current RC execution model
 
@@ -105,10 +105,18 @@ mode through `XDP_OPTIONS`.
 AF_XDP sees Ethernet frames while the transport sees complete IPv4 packets.
 Transmit prepends an untagged Ethernet II header in UMEM. Receive validates the
 EtherType and IPv4 total length directly in the UMEM frame and exposes a
-borrowed IPv4 slice without an intermediate packet allocation. VLAN, QinQ,
-multi-buffer descriptors, and `XDP_USE_SG` are intentionally unsupported in
-this foundation phase. XDP program and XSKMAP management remain a separate
-steering layer.
+borrowed IPv4 slice without an intermediate packet allocation. Batched SEND,
+WRITE, and READ-response payloads are borrowed from checked registered memory
+and encoded directly into the final TX frame, removing the intermediate MTU
+payload copy. Arbitrary registered memory is still distinct from UMEM, so this
+is not payload zero-copy.
+
+The steering layer owns a native XDP BPF link and an XSKMAP. It redirects only
+untagged, unfragmented IPv4 packets without IP options whose UDP destination is
+4791. Other traffic passes to the normal network stack. Queue registrations use
+non-replacing map insertion and are removed before the AF_XDP socket descriptor
+is closed. VLAN, QinQ, multi-buffer descriptors, and `XDP_USE_SG` remain
+intentionally unsupported.
 
 ## Allocation and unsafe-code policy
 
