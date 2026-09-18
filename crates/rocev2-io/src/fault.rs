@@ -630,6 +630,61 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_and_delay_are_one_shot_and_preserve_order() {
+        let first = packet(Opcode::SendOnly, 7, 1);
+        let second = packet(Opcode::SendOnly, 7, 2);
+        let mut inner = MockIo::new(64);
+        inner.inject_receive(&first).unwrap();
+        inner.inject_receive(&second).unwrap();
+        let mut io = FaultInjectIo::<_, 4, 64>::new(inner);
+        io.push_rule(
+            FaultRule::new(FaultAction::Duplicate, FaultDirection::Receive)
+                .packet_number(1),
+        )
+        .unwrap();
+
+        let mut output = [0; 64];
+        assert_eq!(io.receive_ipv4(&mut output).unwrap(), Some(44));
+        assert_eq!(packet_identity(&output[..44]).unwrap().psn, 1);
+        assert_eq!(io.receive_ipv4(&mut output).unwrap(), Some(44));
+        assert_eq!(packet_identity(&output[..44]).unwrap().psn, 1);
+        assert_eq!(io.receive_ipv4(&mut output).unwrap(), Some(44));
+        assert_eq!(packet_identity(&output[..44]).unwrap().psn, 2);
+        assert_eq!(io.statistics().duplicated, 1);
+
+        io.inner_mut().inject_receive(&first).unwrap();
+        io.push_rule(
+            FaultRule::new(FaultAction::Delay, FaultDirection::Receive)
+                .packet_number(3),
+        )
+        .unwrap();
+        assert_eq!(io.receive_ipv4(&mut output).unwrap(), None);
+        assert_eq!(io.receive_ipv4(&mut output).unwrap(), Some(44));
+        assert_eq!(packet_identity(&output[..44]).unwrap().psn, 1);
+        assert_eq!(io.statistics().delayed, 1);
+    }
+
+    #[test]
+    fn repeated_rule_exhausts_and_masks_wire_widths() {
+        let inner = MockIo::new(64);
+        let mut io = FaultInjectIo::<_, 2, 64>::new(inner);
+        io.push_rule(
+            FaultRule::new(FaultAction::Drop, FaultDirection::Transmit)
+                .qpn(0xff00_0007)
+                .psn(0xab00_0009)
+                .times(2),
+        )
+        .unwrap();
+
+        let target = packet(Opcode::SendOnly, 7, 9);
+        io.transmit_ipv4(&target).unwrap();
+        io.transmit_ipv4(&target).unwrap();
+        io.transmit_ipv4(&target).unwrap();
+        assert_eq!(io.statistics().dropped, 2);
+        assert_eq!(io.inner().pending_transmit(), 1);
+    }
+
+    #[test]
     fn receive_duplicate_delay_reorder_and_corrupt_are_deterministic() {
         let mut inner = MockIo::new(64);
         let first = packet(Opcode::SendOnly, 7, 1);
