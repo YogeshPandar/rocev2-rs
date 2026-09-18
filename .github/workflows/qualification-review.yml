@@ -40,16 +40,19 @@ jobs:
           cargo +stable fmt --all
           cargo +1.85.0 generate-lockfile
           for manifest in tools/qualification/Cargo.toml fuzz/Cargo.toml; do
-            if test -f "$manifest"; then cargo +stable fmt --manifest-path "$manifest"; fi
+            if test -f "$manifest"; then
+              cargo +stable fmt --manifest-path "$manifest"
+              cargo +stable generate-lockfile --manifest-path "$manifest"
+            fi
           done
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
           git commit -m 'feat: apply qualification implementation checkpoint'
           git push origin HEAD:feat/qualification-interop-scale
+          git archive --format=zip HEAD > /tmp/qualification-source.zip
           echo "Reviewed source: $(git rev-parse HEAD)"
       - name: Compile and test
-        id: tests
         shell: bash
         run: |
           set -o pipefail
@@ -64,7 +67,7 @@ jobs:
         if: ${{ !cancelled() }}
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           cargo +stable check --locked --workspace --no-default-features --target thumbv7em-none-eabihf 2>&1 | tee /tmp/portable.log
           cargo +1.85.0 check --locked --workspace --all-features 2>&1 | tee /tmp/msrv.log
       - name: Hosted qualification tools
@@ -73,13 +76,27 @@ jobs:
         run: |
           set -euo pipefail
           if test -f tools/qualification/Cargo.toml; then
-            cargo +stable test --manifest-path tools/qualification/Cargo.toml 2>&1 | tee /tmp/tools.log
-            cargo +stable clippy --manifest-path tools/qualification/Cargo.toml --all-targets -- -D warnings 2>&1 | tee /tmp/tools-clippy.log
+            cargo +stable test --locked --manifest-path tools/qualification/Cargo.toml 2>&1 | tee /tmp/tools.log
+            cargo +stable clippy --locked --manifest-path tools/qualification/Cargo.toml --all-targets -- -D warnings 2>&1 | tee /tmp/tools-clippy.log
+            cargo +1.85.0 check --manifest-path tools/qualification/Cargo.toml 2>&1 | tee /tmp/tools-msrv.log
           fi
+      - name: Bounded fuzz oracle tests
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f fuzz/Cargo.toml; then
+            cargo +stable test --locked --manifest-path fuzz/Cargo.toml --lib 2>&1 | tee /tmp/fuzz.log
+          fi
+      - name: Verbs peer and protocol tests
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
           if test -f interop/rxe-peer/Makefile; then
             sudo apt-get update -qq
             sudo apt-get install -y libibverbs-dev
-            make -C interop/rxe-peer 2>&1 | tee /tmp/verbs.log
+            make -C interop/rxe-peer test 2>&1 | tee /tmp/verbs.log
             python3 -m unittest discover -s interop/tests -v 2>&1 | tee /tmp/python.log
           fi
       - name: Publish failure diagnostics
@@ -88,10 +105,10 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const paths = ['/tmp/tests.log','/tmp/clippy.log','/tmp/portable.log','/tmp/msrv.log','/tmp/tools.log','/tmp/tools-clippy.log','/tmp/verbs.log','/tmp/python.log'];
+            const paths = ['/tmp/tests.log','/tmp/clippy.log','/tmp/portable.log','/tmp/msrv.log','/tmp/tools.log','/tmp/tools-clippy.log','/tmp/tools-msrv.log','/tmp/fuzz.log','/tmp/verbs.log','/tmp/python.log'];
             let body = 'Qualification checkpoint diagnostics for run ' + context.runId + '\n';
             for (const path of paths) {
-              if (fs.existsSync(path)) body += '\n### ' + path + '\n```text\n' + fs.readFileSync(path,'utf8').slice(-6500) + '\n```\n';
+              if (fs.existsSync(path)) body += '\n### ' + path + '\n```text\n' + fs.readFileSync(path,'utf8').slice(-5000) + '\n```\n';
             }
             await github.rest.issues.createComment({owner: context.repo.owner, repo: context.repo.repo, issue_number: 9, body});
       - uses: actions/upload-artifact@v4
@@ -99,3 +116,8 @@ jobs:
         with:
           name: qualification-logs
           path: /tmp/*.log
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: qualification-source
+          path: /tmp/qualification-source.zip
