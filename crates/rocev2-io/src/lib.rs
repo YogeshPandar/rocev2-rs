@@ -19,6 +19,7 @@ pub use xdp::XdpSteering;
 #[cfg(all(target_os = "linux", any(feature = "raw-ipv4", feature = "afxdp")))]
 mod entropy;
 mod ethernet;
+mod fault;
 mod fixed;
 #[cfg(all(target_os = "linux", any(feature = "raw-ipv4", feature = "afxdp")))]
 pub use entropy::fill_random;
@@ -35,6 +36,10 @@ pub use afxdp::{
     AfxdpStatistics, AfxdpTxFrame, UmemBacking,
 };
 pub use ethernet::{ETHERNET_HEADER_LEN, EthernetPath};
+pub use fault::{
+    FaultAction, FaultDirection, FaultInjectError, FaultInjectIo, FaultRule, FaultRuleError,
+    FaultStatistics,
+};
 pub use fixed::{FixedFrame, FixedPacketIo, FixedPacketIoError, FixedRxFrame, FixedTxFrame};
 #[cfg(feature = "std")]
 pub use mock::{Frame, MockIo, MockIoError};
