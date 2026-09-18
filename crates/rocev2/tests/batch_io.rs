@@ -123,7 +123,7 @@ fn progress_batch_encodes_requester_payload_from_registered_memory() {
             qp,
             WorkRequest::send(
                 7,
-                Sge::new(mr.address(), u32::try_from(source.len()).unwrap(), mr.lkey()),
+                Sge::new(mr.address(), u32::try_from(mr.length()).unwrap(), mr.lkey()),
                 true,
             ),
         )
