@@ -42,7 +42,7 @@ jobs:
       - name: Run qualification drivers
         run: |
           binary=tools/qualification/target/release/rocev2-qualification
-          "$binary" micro "${{ inputs.iterations }}" | tee qualification-results/micro.jsonl
+          perf stat -x, -e task-clock,cycles,instructions,cache-references,cache-misses             -o qualification-results/micro-perf.csv --             "$binary" micro "${{ inputs.iterations }}" | tee qualification-results/micro.jsonl
           "$binary" scale "${{ inputs.shards }}" | tee qualification-results/scale.jsonl
           "$binary" placement "${{ inputs.interface }}" "${{ inputs.workers }}" | tee qualification-results/placement.jsonl
       - uses: actions/upload-artifact@v4
