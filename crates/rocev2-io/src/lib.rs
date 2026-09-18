@@ -18,6 +18,11 @@ pub use xdp::XdpSteering;
 #[allow(unsafe_code)]
 #[cfg(all(target_os = "linux", any(feature = "raw-ipv4", feature = "afxdp")))]
 mod entropy;
+#[allow(unsafe_code)]
+#[cfg(all(feature = "placement", target_os = "linux"))]
+mod placement;
+#[cfg(all(feature = "placement", target_os = "linux"))]
+pub use placement::{NumaTopology, allowed_cpus, parse_cpu_list, pin_current_thread};
 mod ethernet;
 mod fault;
 mod fixed;

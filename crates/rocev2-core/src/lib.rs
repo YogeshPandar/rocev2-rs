@@ -15,6 +15,7 @@ mod retry;
 mod ring;
 mod scheduler;
 mod segment;
+mod shard;
 mod work;
 
 pub use ack::{AckAdvance, MAX_OUTSTANDING_PACKETS, ReceiveDisposition, ReceivePsn, SendWindow};
@@ -28,6 +29,7 @@ pub use retry::{
 pub use ring::{PushError, Ring};
 pub use scheduler::{ReadyQueue, TimerEntry, TimerScheduler};
 pub use segment::{Segment, SegmentError, Segmenter, TransferKind};
+pub use shard::QpnShardPlan;
 pub use work::{
     Completion, CompletionOpcode, CompletionStatus, RecvWorkRequest, Sge, WorkRequest,
     WorkRequestKind,

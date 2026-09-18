@@ -1,0 +1,127 @@
+name: qualification-review
+on:
+  push:
+    branches: [feat/qualification-interop-scale]
+    paths: [.review/qualification.patch, .github/workflows/qualification-review.yml]
+permissions:
+  contents: write
+  pull-requests: write
+concurrency:
+  group: qualification-review
+  cancel-in-progress: false
+jobs:
+  review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: thumbv7em-none-eabihf
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Apply source checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f .review/qualification.patch; then
+            python3 - <<'PY'
+          import base64, hashlib, lzma, pathlib
+          header, encoded = pathlib.Path('.review/qualification.patch').read_bytes().split(b'\n', 1)
+          patch = lzma.decompress(base64.b64decode(encoded.strip(), validate=True))
+          assert header == b'xz:' + hashlib.sha256(patch).hexdigest().encode()
+          pathlib.Path('/tmp/qualification.patch').write_bytes(patch)
+          PY
+            git apply --check --exclude='.github/workflows/*' --exclude='*/__pycache__/*' /tmp/qualification.patch
+            git apply --exclude='.github/workflows/*' --exclude='*/__pycache__/*' /tmp/qualification.patch
+            git rm .review/qualification.patch
+          fi
+          cargo +stable fmt --all
+          cargo +1.85.0 generate-lockfile
+          for manifest in tools/qualification/Cargo.toml fuzz/Cargo.toml; do
+            if test -f "$manifest"; then
+              cargo +stable fmt --manifest-path "$manifest"
+              cargo +stable generate-lockfile --manifest-path "$manifest"
+            fi
+          done
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m 'feat: apply qualification implementation checkpoint'
+            git push origin HEAD:feat/qualification-interop-scale
+          fi
+          git archive --format=zip HEAD > /tmp/qualification-source.zip
+          echo "Reviewed source: $(git rev-parse HEAD)"
+      - name: Compile and test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +stable test --locked --workspace --all-features 2>&1 | tee /tmp/tests.log
+      - name: Strict Clippy
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +stable clippy --locked --workspace --all-features --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.log
+      - name: Portable no_std and MSRV
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +stable check --locked --workspace --no-default-features --target thumbv7em-none-eabihf 2>&1 | tee /tmp/portable.log
+          cargo +1.85.0 check --locked --workspace --all-features 2>&1 | tee /tmp/msrv.log
+      - name: Hosted qualification tools
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f tools/qualification/Cargo.toml; then
+            cargo +stable test --locked --manifest-path tools/qualification/Cargo.toml 2>&1 | tee /tmp/tools.log
+            cargo +stable clippy --locked --manifest-path tools/qualification/Cargo.toml --all-targets -- -D warnings 2>&1 | tee /tmp/tools-clippy.log
+            cargo +1.85.0 check --manifest-path tools/qualification/Cargo.toml 2>&1 | tee /tmp/tools-msrv.log
+          fi
+      - name: Bounded fuzz oracle tests
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f fuzz/Cargo.toml; then
+            cargo +stable test --locked --manifest-path fuzz/Cargo.toml --lib 2>&1 | tee /tmp/fuzz.log
+          fi
+      - name: Verbs peer and protocol tests
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f interop/rxe-peer/Makefile; then
+            sudo apt-get update -qq
+            sudo apt-get install -y libibverbs-dev
+            make -C interop/rxe-peer test 2>&1 | tee /tmp/verbs.log
+            python3 -m unittest discover -s interop/tests -v 2>&1 | tee /tmp/python.log
+          fi
+      - name: Publish failure diagnostics
+        if: ${{ failure() }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const paths = ['/tmp/tests.log','/tmp/clippy.log','/tmp/portable.log','/tmp/msrv.log','/tmp/tools.log','/tmp/tools-clippy.log','/tmp/tools-msrv.log','/tmp/fuzz.log','/tmp/verbs.log','/tmp/python.log'];
+            let body = 'Qualification checkpoint diagnostics for run ' + context.runId + '\n';
+            for (const path of paths) {
+              if (fs.existsSync(path)) body += '\n### ' + path + '\n```text\n' + fs.readFileSync(path,'utf8').slice(-5000) + '\n```\n';
+            }
+            await github.rest.issues.createComment({owner: context.repo.owner, repo: context.repo.repo, issue_number: 9, body});
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: qualification-logs
+          path: /tmp/*.log
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: qualification-source
+          path: /tmp/qualification-source.zip

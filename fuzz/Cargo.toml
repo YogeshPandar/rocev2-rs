@@ -1,0 +1,46 @@
+[package]
+name = "rocev2-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rocev2 = { path = "../crates/rocev2", default-features = false }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_roundtrip"
+path = "fuzz_targets/wire_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "memory_registry"
+path = "fuzz_targets/memory_registry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rc_events"
+path = "fuzz_targets/rc_events.rs"
+test = false
+doc = false
+bench = false
+
