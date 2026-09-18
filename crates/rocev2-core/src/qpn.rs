@@ -1,5 +1,7 @@
 //! Fixed-capacity queue-pair number lookup.
 
+use core::fmt;
+
 /// Largest queue-pair number carried by the 24-bit BTH field.
 pub const MAX_QPN: u32 = 0x00ff_ffff;
 
@@ -32,6 +34,18 @@ pub enum QpnInsertError {
     /// Every table entry is occupied.
     Full,
 }
+
+impl fmt::Display for QpnInsertError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidQpn(qpn) => write!(formatter, "QPN {qpn} exceeds 24 bits"),
+            Self::Duplicate(qpn) => write!(formatter, "QPN {qpn} is already present"),
+            Self::Full => formatter.write_str("QPN table is full"),
+        }
+    }
+}
+
+impl core::error::Error for QpnInsertError {}
 
 /// Allocation-free open-addressed map from a 24-bit QPN to a QP slot.
 ///
