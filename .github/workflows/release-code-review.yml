@@ -2,55 +2,37 @@ name: release-code-review
 on:
   push:
     branches: [feat/release-code-hardening]
-    paths: [.review/release-code.patch, .github/workflows/release-code-review.yml]
+    paths:
+      - crates/**
+      - interop/**
+      - tools/**
+      - fuzz/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/release-code-review.yml
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 concurrency:
   group: release-code-review
-  cancel-in-progress: false
+  cancel-in-progress: true
 jobs:
   review:
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
           targets: thumbv7em-none-eabihf
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
-      - name: Apply source checkpoint
-        shell: bash
+      - name: Format
         run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import base64, hashlib, lzma, pathlib
-          path = pathlib.Path('.review/release-code.patch')
-          header, encoded = path.read_bytes().split(b'\n', 1)
-          patch = lzma.decompress(base64.b64decode(encoded.strip(), validate=True))
-          assert header == b'xz:' + hashlib.sha256(patch).hexdigest().encode()
-          pathlib.Path('/tmp/release-code.patch').write_bytes(patch)
-          PY
-          git apply --check /tmp/release-code.patch
-          git apply /tmp/release-code.patch
-          git rm .review/release-code.patch
-          cargo +stable fmt --all
-          cargo +1.85.0 generate-lockfile
-          for manifest in fuzz/Cargo.toml interop/rust-peer/Cargo.toml tools/qualification/Cargo.toml; do
-            if test -f "$manifest"; then
-              cargo +stable fmt --manifest-path "$manifest"
-              cargo +stable generate-lockfile --manifest-path "$manifest"
-            fi
-          done
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A -- . ':(exclude).github/workflows/**'
-          git commit -m 'feat: add executable release qualification tooling'
-          git push origin HEAD:feat/release-code-hardening
+          cargo +stable fmt --all --check
+          cargo +stable fmt --manifest-path fuzz/Cargo.toml --check
+          cargo +stable fmt --manifest-path interop/rust-peer/Cargo.toml --check
+          cargo +stable fmt --manifest-path tools/qualification/Cargo.toml --check
       - name: Workspace tests
         run: cargo +stable test --locked --workspace --all-features --all-targets
       - name: Strict Clippy
