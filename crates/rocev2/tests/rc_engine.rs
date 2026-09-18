@@ -1227,3 +1227,89 @@ fn read_responder_remains_scheduled_after_backend_transmit_failure() {
     assert_eq!(packet.transport.bth.psn, 70);
     assert_eq!(packet.transport.payload, &[0x85; 8]);
 }
+
+#[test]
+fn posted_memory_stays_busy_until_reset_or_error_flush() {
+    for destination in [QpState::Reset, QpState::Error] {
+        let mut bytes = [0x22; 16];
+        let mut endpoint = endpoint();
+        let mr = endpoint
+            .register_memory(&mut bytes, AccessFlags::LOCAL_WRITE)
+            .unwrap();
+        let qp = endpoint
+            .create_qp(qp_config(2, 3, 10, 30, [192, 0, 2, 1], [192, 0, 2, 2]))
+            .unwrap();
+        ready(&mut endpoint, qp);
+        let sge = Sge::new(mr.address(), 8, mr.lkey());
+        endpoint
+            .post_work_batch(
+                qp,
+                &[
+                    WorkRequest::send(1, sge, false),
+                    WorkRequest::send(2, sge, true),
+                ],
+            )
+            .unwrap();
+        endpoint
+            .post_receive_batch(
+                qp,
+                &[RecvWorkRequest::new(3, sge), RecvWorkRequest::new(4, sge)],
+            )
+            .unwrap();
+        assert!(matches!(
+            endpoint.deregister_memory(mr),
+            Err(rocev2::ApiError::Memory(rocev2::MemoryError::RegionBusy))
+        ));
+        let mut receive = [0; 512];
+        let mut transmit = [0; 512];
+        endpoint.progress(0, &mut receive, &mut transmit).unwrap();
+        assert!(matches!(
+            endpoint.deregister_memory(mr),
+            Err(rocev2::ApiError::Memory(rocev2::MemoryError::RegionBusy))
+        ));
+        endpoint.transition_qp(qp, destination).unwrap();
+        endpoint.deregister_memory(mr).unwrap();
+        let mut completions = 0;
+        while let Some(completion) = endpoint.poll_completion(qp).unwrap() {
+            assert_eq!(completion.status, CompletionStatus::Flushed);
+            completions += 1;
+        }
+        assert_eq!(completions, 4);
+    }
+}
+
+#[test]
+fn rejected_batch_does_not_retain_valid_prefix() {
+    let mut bytes = [0; 8];
+    let mut endpoint = endpoint();
+    let mr = endpoint
+        .register_memory(&mut bytes, AccessFlags::LOCAL_WRITE)
+        .unwrap();
+    let qp = endpoint
+        .create_qp(qp_config(2, 3, 10, 30, [192, 0, 2, 1], [192, 0, 2, 2]))
+        .unwrap();
+    ready(&mut endpoint, qp);
+    let good = Sge::new(mr.address(), 8, mr.lkey());
+    let bad = Sge::new(mr.address(), 9, mr.lkey());
+    assert!(
+        endpoint
+            .post_work_batch(
+                qp,
+                &[
+                    WorkRequest::send(1, good, true),
+                    WorkRequest::send(2, bad, true)
+                ]
+            )
+            .is_err()
+    );
+    assert!(
+        endpoint
+            .post_receive_batch(
+                qp,
+                &[RecvWorkRequest::new(3, good), RecvWorkRequest::new(4, bad)]
+            )
+            .is_err()
+    );
+    endpoint.deregister_memory(mr).unwrap();
+    assert_eq!(endpoint.poll_completion(qp).unwrap(), None);
+}

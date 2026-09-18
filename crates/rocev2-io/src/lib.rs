@@ -10,8 +10,13 @@
 #[allow(unsafe_code)]
 #[cfg(all(feature = "afxdp", target_os = "linux"))]
 mod afxdp;
+#[allow(unsafe_code)]
+#[cfg(all(target_os = "linux", any(feature = "raw-ipv4", feature = "afxdp")))]
+mod entropy;
 mod ethernet;
 mod fixed;
+#[cfg(all(target_os = "linux", any(feature = "raw-ipv4", feature = "afxdp")))]
+pub use entropy::fill_random;
 #[cfg(feature = "std")]
 mod mock;
 

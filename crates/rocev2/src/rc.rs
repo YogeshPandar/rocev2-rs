@@ -18,7 +18,9 @@ use rocev2_core::{
     TimerEntry, TimerScheduler, WorkRequest, WorkRequestKind, ack_timeout_ticks, rnr_timer_ticks,
 };
 use rocev2_io::{PacketBatchIo, PacketIo, TxPacket};
-use rocev2_memory::{AccessFlags, MemoryError, MemoryRegistry, RegionHandle};
+use rocev2_memory::{
+    AccessFlags, KeyGenerator, MemoryAccess, MemoryError, MemoryRegistry, RegionHandle, RegionLease,
+};
 use rocev2_wire::{
     AETH_LEN, Aeth, AethClass, BTH_LEN, Bth, ICRC_LEN, IPV4_HEADER_LEN, NakCode, Opcode, PacketRef,
     PacketSpec, RETH_LEN, Reth, SegmentPosition, UDP_HEADER_LEN,
@@ -210,6 +212,42 @@ struct ReadResponseState {
 }
 
 #[derive(Debug)]
+struct PostedWork<T> {
+    work: T,
+    lease: Option<RegionLease>,
+}
+
+fn release_lease<const MRS: usize>(
+    memory: &mut MemoryRegistry<'_, MRS>,
+    lease: &mut Option<RegionLease>,
+) {
+    let result = memory.release(lease);
+    debug_assert!(
+        result.is_ok(),
+        "endpoint owns only leases from its registry"
+    );
+}
+
+fn retain_batch<const MRS: usize, const B: usize>(
+    memory: &mut MemoryRegistry<'_, MRS>,
+    keys: impl Iterator<Item = u32>,
+) -> Result<[Option<RegionLease>; B], ApiError> {
+    let mut leases = core::array::from_fn(|_| None);
+    for (index, key) in keys.enumerate() {
+        match memory.retain_local(key) {
+            Ok(lease) => leases[index] = Some(lease),
+            Err(error) => {
+                for lease in &mut leases {
+                    release_lease(memory, lease);
+                }
+                return Err(error.into());
+            }
+        }
+    }
+    Ok(leases)
+}
+
+#[derive(Debug)]
 struct RcQpSlot<const SQ: usize, const RQ: usize, const CQ: usize> {
     generation: u32,
     machine: QpStateMachine,
@@ -217,11 +255,14 @@ struct RcQpSlot<const SQ: usize, const RQ: usize, const CQ: usize> {
     rnr_nak_timer: u8,
     send_window: SendWindow,
     receive_psn: ReceivePsn,
-    send_queue: Ring<WorkRequest, SQ>,
-    receive_queue: Ring<RecvWorkRequest, RQ>,
+    send_queue: Ring<PostedWork<WorkRequest>, SQ>,
+    receive_queue: Ring<PostedWork<RecvWorkRequest>, RQ>,
     completion_queue: Ring<Completion, CQ>,
     completion_reservations: usize,
     active_request: Option<ActiveRequest>,
+    active_memory: Option<RegionLease>,
+    inbound_memory: Option<RegionLease>,
+    read_memory: Option<RegionLease>,
     inbound_message: Option<InboundMessage>,
     read_response: Option<ReadResponseState>,
     read_replay: Option<ReadResponseState>,
@@ -245,6 +286,9 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
             completion_queue: Ring::new(),
             completion_reservations: 0,
             active_request: None,
+            active_memory: None,
+            inbound_memory: None,
+            read_memory: None,
             inbound_message: None,
             read_response: None,
             read_replay: None,
@@ -291,7 +335,13 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
         }
     }
 
-    fn finish_active(&mut self, status: CompletionStatus, byte_len: u32) -> usize {
+    fn finish_active<const MRS: usize>(
+        &mut self,
+        memory: &mut MemoryRegistry<'_, MRS>,
+        status: CompletionStatus,
+        byte_len: u32,
+    ) -> usize {
+        release_lease(memory, &mut self.active_memory);
         let Some(active) = self.active_request.take() else {
             return 0;
         };
@@ -307,12 +357,14 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
         self.resolve_reserved_completion(completion)
     }
 
-    fn finish_receive(
+    fn finish_receive<const MRS: usize>(
         &mut self,
+        memory: &mut MemoryRegistry<'_, MRS>,
         work: RecvWorkRequest,
         status: CompletionStatus,
         byte_len: u32,
     ) -> usize {
+        release_lease(memory, &mut self.inbound_memory);
         let completion = if matches!(status, CompletionStatus::Success) {
             Completion::success(work.id, CompletionOpcode::Receive, byte_len)
         } else {
@@ -321,19 +373,23 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
         self.resolve_reserved_completion(Some(completion))
     }
 
-    fn flush_pending(&mut self) -> usize {
+    fn flush_pending<const MRS: usize>(&mut self, memory: &mut MemoryRegistry<'_, MRS>) -> usize {
         let mut generated = 0;
-        generated += self.finish_active(CompletionStatus::Flushed, 0);
+        generated += self.finish_active(memory, CompletionStatus::Flushed, 0);
 
         if let Some(InboundMessage::Send { work, .. }) = self.inbound_message.take() {
-            generated += self.finish_receive(work, CompletionStatus::Flushed, 0);
+            generated += self.finish_receive(memory, work, CompletionStatus::Flushed, 0);
         } else {
             self.inbound_message = None;
         }
+        release_lease(memory, &mut self.inbound_memory);
+        release_lease(memory, &mut self.read_memory);
         self.read_response = None;
         self.read_replay = None;
 
-        while let Some(work) = self.send_queue.pop() {
+        while let Some(mut posted) = self.send_queue.pop() {
+            release_lease(memory, &mut posted.lease);
+            let work = posted.work;
             let opcode = match work.kind {
                 WorkRequestKind::Send => CompletionOpcode::Send,
                 WorkRequestKind::RdmaWrite { .. } => CompletionOpcode::RdmaWrite,
@@ -345,18 +401,19 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
                 CompletionStatus::Flushed,
             )));
         }
-        while let Some(work) = self.receive_queue.pop() {
-            generated += self.finish_receive(work, CompletionStatus::Flushed, 0);
+        while let Some(mut posted) = self.receive_queue.pop() {
+            release_lease(memory, &mut posted.lease);
+            generated += self.finish_receive(memory, posted.work, CompletionStatus::Flushed, 0);
         }
         generated
     }
 
-    fn enter_error(&mut self) -> usize {
+    fn enter_error<const MRS: usize>(&mut self, memory: &mut MemoryRegistry<'_, MRS>) -> usize {
         if !matches!(self.machine.state(), QpState::Error) {
             let transition = self.machine.transition(QpState::Error);
             debug_assert!(transition.is_ok());
         }
-        self.flush_pending()
+        self.flush_pending(memory)
     }
 
     fn is_busy(&self) -> bool {
@@ -607,9 +664,9 @@ where
         &self.memory
     }
 
-    /// Mutably borrow the checked registered-memory table.
-    pub fn memory_registry_mut(&mut self) -> &mut MemoryRegistry<'memory, MRS> {
-        &mut self.memory
+    /// Borrow checked copy operations without allowing registry replacement.
+    pub fn memory_registry_mut(&mut self) -> MemoryAccess<'_, 'memory, MRS> {
+        self.memory.access()
     }
 
     /// Register an exclusive application buffer.
@@ -621,11 +678,22 @@ where
         Ok(self.memory.register(memory, access)?)
     }
 
+    /// Register with an external production key source instead of the development seed.
+    pub fn register_memory_with_key_generator(
+        &mut self,
+        memory: &'memory mut [u8],
+        access: AccessFlags,
+        generator: &mut impl KeyGenerator,
+    ) -> Result<RegionHandle, ApiError> {
+        Ok(self
+            .memory
+            .register_with_key_generator(memory, access, generator)?)
+    }
+
     /// Remove a memory registration and return its original exclusive slice.
     ///
-    /// The caller must ensure no posted WQE still references the region. If a
-    /// stale key is encountered later, the affected QP completes with a local
-    /// protection error rather than dereferencing the stale region.
+    /// Returns `MemoryError::RegionBusy` while posted or active work references
+    /// the region. Success, failure, and QP flush release references exactly once.
     pub fn deregister_memory(
         &mut self,
         handle: RegionHandle,
@@ -745,10 +813,10 @@ where
             let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
             if matches!(destination, QpState::Error) {
                 slot.machine.transition(destination)?;
-                slot.flush_pending()
+                slot.flush_pending(&mut self.memory)
             } else if matches!(destination, QpState::Reset) {
                 slot.machine.transition(destination)?;
-                let completions = slot.flush_pending();
+                let completions = slot.flush_pending(&mut self.memory);
                 slot.reset_transport_state();
                 completions
             } else {
@@ -783,11 +851,18 @@ where
                 return Err(ApiError::QueueFull(QueueKind::Send));
             }
             slot.reserve_completion()?;
-            if let Err(error) = slot.send_queue.push(work) {
+            let lease = match self.memory.retain_local(work.sge.lkey) {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    slot.completion_reservations -= 1;
+                    return Err(error.into());
+                }
+            };
+            if let Err(error) = slot.send_queue.push(PostedWork { work, lease }) {
+                let mut posted = error.into_inner();
+                release_lease(&mut self.memory, &mut posted.lease);
                 slot.completion_reservations = slot.completion_reservations.saturating_sub(1);
-                return Err(ApiError::QueueFull(match error {
-                    rocev2_core::PushError::Full(_) => QueueKind::Send,
-                }));
+                return Err(ApiError::QueueFull(QueueKind::Send));
             }
         }
         self.synchronize_qp(index);
@@ -834,10 +909,12 @@ where
             validate_posted_work(&self.memory, *work, mtu)?;
         }
 
+        let leases =
+            retain_batch::<MRS, SQ>(&mut self.memory, works.iter().map(|work| work.sge.lkey))?;
         let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
         slot.completion_reservations += works.len();
-        for work in works {
-            let pushed = slot.send_queue.push(*work);
+        for (work, lease) in works.iter().zip(leases) {
+            let pushed = slot.send_queue.push(PostedWork { work: *work, lease });
             debug_assert!(pushed.is_ok());
         }
         self.synchronize_qp(index);
@@ -875,11 +952,18 @@ where
             return Err(ApiError::QueueFull(QueueKind::Receive));
         }
         slot.reserve_completion()?;
-        if let Err(error) = slot.receive_queue.push(work) {
+        let lease = match self.memory.retain_local(work.sge.lkey) {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                slot.completion_reservations -= 1;
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = slot.receive_queue.push(PostedWork { work, lease }) {
+            let mut posted = error.into_inner();
+            release_lease(&mut self.memory, &mut posted.lease);
             slot.completion_reservations = slot.completion_reservations.saturating_sub(1);
-            return Err(ApiError::QueueFull(match error {
-                rocev2_core::PushError::Full(_) => QueueKind::Receive,
-            }));
+            return Err(ApiError::QueueFull(QueueKind::Receive));
         }
         self.stats.posted_receive_requests = self.stats.posted_receive_requests.saturating_add(1);
         Ok(())
@@ -928,10 +1012,12 @@ where
                 .validate_local_write(work.sge.lkey, work.sge.address, length)?;
         }
 
+        let leases =
+            retain_batch::<MRS, RQ>(&mut self.memory, works.iter().map(|work| work.sge.lkey))?;
         let slot = self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?;
         slot.completion_reservations += works.len();
-        for work in works {
-            let pushed = slot.receive_queue.push(*work);
+        for (work, lease) in works.iter().zip(leases) {
+            let pushed = slot.receive_queue.push(PostedWork { work: *work, lease });
             debug_assert!(pushed.is_ok());
         }
         self.stats.posted_receive_requests = self
@@ -1210,7 +1296,7 @@ where
             match action {
                 RequestPhase::Waiting => {
                     self.stats.timeout_events = self.stats.timeout_events.saturating_add(1);
-                    let retry = schedule_transport_retry(slot, &mut self.stats);
+                    let retry = schedule_transport_retry(slot, &mut self.memory, &mut self.stats);
                     result.completions += retry.completions;
                     result.retransmissions += retry.retransmissions;
                 }
@@ -1338,7 +1424,7 @@ where
             .qps
             .get_mut(index)
             .and_then(Option::as_mut)
-            .map_or(0, |slot| slot.enter_error());
+            .map_or(0, |slot| slot.enter_error(&mut self.memory));
         self.synchronize_qp(index);
         self.stats.completions = self
             .stats
@@ -1360,6 +1446,7 @@ where
             active.next_packet += 1;
             if active.next_packet == active.packet_count {
                 slot.read_response = None;
+                release_lease(&mut self.memory, &mut slot.read_memory);
             }
         }
         self.synchronize_qp(index);
@@ -1411,6 +1498,7 @@ where
                 Err(RequestPacketError::LocalProtection) => {
                     generated += fail_active_and_error(
                         self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?,
+                        &mut self.memory,
                         CompletionStatus::LocalProtectionError,
                     );
                     self.synchronize_qp(index);
@@ -1502,6 +1590,7 @@ where
                 Err(RequestPacketError::LocalProtection) => {
                     generated += fail_active_and_error(
                         self.qps[index].as_mut().ok_or(ApiError::InvalidQpHandle)?,
+                        &mut self.memory,
                         CompletionStatus::LocalProtectionError,
                     );
                     self.synchronize_qp(index);
@@ -2411,7 +2500,7 @@ fn start_next_request<const SQ: usize, const RQ: usize, const CQ: usize>(
     if slot.active_request.is_some() || !slot.machine.can_send() {
         return;
     }
-    let Some(work) = slot.send_queue.front().copied() else {
+    let Some(work) = slot.send_queue.front().map(|posted| posted.work) else {
         return;
     };
     let config = slot.machine.config();
@@ -2422,8 +2511,11 @@ fn start_next_request<const SQ: usize, const RQ: usize, const CQ: usize>(
     let timeout_ticks = ack_timeout_ticks(config.timeout, ticks_per_second).unwrap_or(u64::MAX);
     let policy = RetryPolicy::new(config.retry_count, config.rnr_retry_count, timeout_ticks)
         .expect("validated QP retry counts");
-    let removed = slot.send_queue.pop();
-    debug_assert_eq!(removed, Some(work));
+    let Some(posted) = slot.send_queue.pop() else {
+        return;
+    };
+    debug_assert_eq!(posted.work, work);
+    slot.active_memory = posted.lease;
     slot.active_request = Some(ActiveRequest {
         work,
         first_psn,
@@ -2638,7 +2730,7 @@ fn handle_request_packet<const MRS: usize, const SQ: usize, const RQ: usize, con
     }
 
     if packet.bth.partition_key != Bth::DEFAULT_PKEY {
-        return fatal_request_error(slot, received_psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, received_psn, Aeth::NAK_INVALID_REQUEST);
     }
 
     match packet.bth.opcode {
@@ -2658,18 +2750,20 @@ fn handle_request_packet<const MRS: usize, const SQ: usize, const RQ: usize, con
         | Opcode::RdmaReadResponseMiddle
         | Opcode::RdmaReadResponseLast
         | Opcode::RdmaReadResponseOnly
-        | Opcode::Acknowledge => fatal_request_error(slot, received_psn, Aeth::NAK_INVALID_REQUEST),
+        | Opcode::Acknowledge => {
+            fatal_request_error(slot, memory, received_psn, Aeth::NAK_INVALID_REQUEST)
+        }
     }
 }
 
 fn replay_read_request<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
-    memory: &MemoryRegistry<'_, MRS>,
+    memory: &mut MemoryRegistry<'_, MRS>,
     packet: PacketRef<'_>,
     psn: Psn,
 ) -> HandlerResult {
     let Some(reth) = packet.reth else {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     };
     let replay = ReadResponseState {
         request_psn: psn,
@@ -2687,7 +2781,7 @@ fn replay_read_request<const MRS: usize, const SQ: usize, const RQ: usize, const
         )
         .is_err()
     {
-        return fatal_request_error(slot, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
     }
 
     if slot.read_replay != Some(replay)
@@ -2705,6 +2799,12 @@ fn replay_read_request<const MRS: usize, const SQ: usize, const RQ: usize, const
         };
     }
 
+    if slot.read_memory.is_none() {
+        match memory.retain_remote(replay.rkey) {
+            Ok(lease) => slot.read_memory = Some(lease),
+            Err(_) => return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR),
+        }
+    }
     slot.read_response = Some(replay);
     HandlerResult::default()
 }
@@ -2718,7 +2818,7 @@ fn handle_send_request<const MRS: usize, const SQ: usize, const RQ: usize, const
     let position = packet.bth.opcode.position();
     let mtu = slot.machine.config().path_mtu.bytes();
     if !valid_request_payload_length(position, packet.payload.len(), mtu) {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     }
 
     match position {
@@ -2739,9 +2839,9 @@ fn handle_send_start<const MRS: usize, const SQ: usize, const RQ: usize, const C
     position: SegmentPosition,
 ) -> HandlerResult {
     if slot.inbound_message.is_some() {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     }
-    let Some(work) = slot.receive_queue.pop() else {
+    let Some(posted) = slot.receive_queue.pop() else {
         return HandlerResult {
             reply: Some(control_reply(
                 slot,
@@ -2751,17 +2851,21 @@ fn handle_send_start<const MRS: usize, const SQ: usize, const RQ: usize, const C
             ..HandlerResult::default()
         };
     };
+    let work = posted.work;
+    slot.inbound_memory = posted.lease;
     if packet.payload.len() > usize::try_from(work.sge.length).unwrap_or(usize::MAX) {
-        let mut result = fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
-        result.completions += slot.finish_receive(work, CompletionStatus::LocalLengthError, 0);
+        let mut result = fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
+        result.completions +=
+            slot.finish_receive(memory, work, CompletionStatus::LocalLengthError, 0);
         return result;
     }
     if memory
         .write_local(work.sge.lkey, work.sge.address, packet.payload)
         .is_err()
     {
-        let mut result = fatal_request_error(slot, psn, Aeth::NAK_REMOTE_OPERATION_ERROR);
-        result.completions += slot.finish_receive(work, CompletionStatus::LocalProtectionError, 0);
+        let mut result = fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_OPERATION_ERROR);
+        result.completions +=
+            slot.finish_receive(memory, work, CompletionStatus::LocalProtectionError, 0);
         return result;
     }
 
@@ -2769,7 +2873,8 @@ fn handle_send_start<const MRS: usize, const SQ: usize, const RQ: usize, const C
     slot.receive_psn.observe(psn);
     if matches!(position, SegmentPosition::Only) {
         slot.message_sequence_number = slot.message_sequence_number.next();
-        let completions = slot.finish_receive(work, CompletionStatus::Success, bytes_written);
+        let completions =
+            slot.finish_receive(memory, work, CompletionStatus::Success, bytes_written);
         HandlerResult {
             reply: Some(ack_reply(slot, psn)),
             completions,
@@ -2799,31 +2904,31 @@ fn handle_send_continuation<const MRS: usize, const SQ: usize, const RQ: usize, 
         bytes_written,
     }) = slot.inbound_message
     else {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     };
     let Some(new_total) =
         bytes_written.checked_add(u32::try_from(packet.payload.len()).unwrap_or(u32::MAX))
     else {
-        return fail_receive_message(slot, psn, CompletionStatus::LocalLengthError);
+        return fail_receive_message(slot, memory, psn, CompletionStatus::LocalLengthError);
     };
     if new_total > work.sge.length {
-        return fail_receive_message(slot, psn, CompletionStatus::LocalLengthError);
+        return fail_receive_message(slot, memory, psn, CompletionStatus::LocalLengthError);
     }
     let Some(address) = work.sge.address.checked_add(u64::from(bytes_written)) else {
-        return fail_receive_message(slot, psn, CompletionStatus::LocalLengthError);
+        return fail_receive_message(slot, memory, psn, CompletionStatus::LocalLengthError);
     };
     if memory
         .write_local(work.sge.lkey, address, packet.payload)
         .is_err()
     {
-        return fail_receive_message(slot, psn, CompletionStatus::LocalProtectionError);
+        return fail_receive_message(slot, memory, psn, CompletionStatus::LocalProtectionError);
     }
 
     slot.receive_psn.observe(psn);
     if matches!(position, SegmentPosition::Last) {
         slot.inbound_message = None;
         slot.message_sequence_number = slot.message_sequence_number.next();
-        let completions = slot.finish_receive(work, CompletionStatus::Success, new_total);
+        let completions = slot.finish_receive(memory, work, CompletionStatus::Success, new_total);
         HandlerResult {
             reply: Some(ack_reply(slot, psn)),
             completions,
@@ -2850,7 +2955,7 @@ fn handle_write_request<const MRS: usize, const SQ: usize, const RQ: usize, cons
     let position = packet.bth.opcode.position();
     let mtu = slot.machine.config().path_mtu.bytes();
     if !valid_request_payload_length(position, packet.payload.len(), mtu) {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     }
 
     match position {
@@ -2871,10 +2976,10 @@ fn handle_write_start<const MRS: usize, const SQ: usize, const RQ: usize, const 
     position: SegmentPosition,
 ) -> HandlerResult {
     if slot.inbound_message.is_some() {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     }
     let Some(reth) = packet.reth else {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     };
     let payload_length = u32::try_from(packet.payload.len()).unwrap_or(u32::MAX);
     let length_is_valid = match position {
@@ -2883,7 +2988,7 @@ fn handle_write_start<const MRS: usize, const SQ: usize, const RQ: usize, const 
         SegmentPosition::Middle | SegmentPosition::Last => false,
     };
     if !length_is_valid {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     }
     if memory
         .validate_remote_write(
@@ -2892,11 +2997,21 @@ fn handle_write_start<const MRS: usize, const SQ: usize, const RQ: usize, const 
             usize::try_from(reth.dma_length).unwrap_or(usize::MAX),
         )
         .is_err()
-        || memory
-            .write_remote(reth.remote_key, reth.virtual_address, packet.payload)
-            .is_err()
     {
-        return fatal_request_error(slot, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
+    }
+
+    if matches!(position, SegmentPosition::First) {
+        match memory.retain_remote(reth.remote_key) {
+            Ok(lease) => slot.inbound_memory = Some(lease),
+            Err(_) => return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR),
+        }
+    }
+    if memory
+        .write_remote(reth.remote_key, reth.virtual_address, packet.payload)
+        .is_err()
+    {
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
     }
 
     slot.receive_psn.observe(psn);
@@ -2935,12 +3050,12 @@ fn handle_write_continuation<
         bytes_written,
     }) = slot.inbound_message
     else {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     };
     let Some(new_total) =
         bytes_written.checked_add(u32::try_from(packet.payload.len()).unwrap_or(u32::MAX))
     else {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     };
     let valid_position = match position {
         SegmentPosition::Middle => new_total < total_length,
@@ -2948,21 +3063,22 @@ fn handle_write_continuation<
         SegmentPosition::First | SegmentPosition::Only => false,
     };
     if !valid_position {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     }
     let Some(segment_address) = address.checked_add(u64::from(bytes_written)) else {
-        return fatal_request_error(slot, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
     };
     if memory
         .write_remote(rkey, segment_address, packet.payload)
         .is_err()
     {
-        return fatal_request_error(slot, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
     }
 
     slot.receive_psn.observe(psn);
     if matches!(position, SegmentPosition::Last) {
         slot.inbound_message = None;
+        release_lease(memory, &mut slot.inbound_memory);
         slot.message_sequence_number = slot.message_sequence_number.next();
     } else {
         slot.inbound_message = Some(InboundMessage::Write {
@@ -2985,7 +3101,7 @@ fn handle_read_request<const MRS: usize, const SQ: usize, const RQ: usize, const
     psn: Psn,
 ) -> HandlerResult {
     if slot.inbound_message.is_some() {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     }
     if slot.read_response.is_some() {
         return HandlerResult {
@@ -2998,7 +3114,7 @@ fn handle_read_request<const MRS: usize, const SQ: usize, const RQ: usize, const
         };
     }
     let Some(reth) = packet.reth else {
-        return fatal_request_error(slot, psn, Aeth::NAK_INVALID_REQUEST);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_INVALID_REQUEST);
     };
     if memory
         .validate_remote_read(
@@ -3008,9 +3124,13 @@ fn handle_read_request<const MRS: usize, const SQ: usize, const RQ: usize, const
         )
         .is_err()
     {
-        return fatal_request_error(slot, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
+        return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR);
     }
 
+    match memory.retain_remote(reth.remote_key) {
+        Ok(lease) => slot.read_memory = Some(lease),
+        Err(_) => return fatal_request_error(slot, memory, psn, Aeth::NAK_REMOTE_ACCESS_ERROR),
+    }
     let packets = packet_count(reth.dma_length, slot.machine.config().path_mtu.bytes());
     slot.receive_psn.observe_span(psn, packets);
     slot.message_sequence_number = slot.message_sequence_number.next();
@@ -3034,8 +3154,9 @@ fn valid_request_payload_length(position: SegmentPosition, length: usize, mtu: u
     }
 }
 
-fn fail_receive_message<const SQ: usize, const RQ: usize, const CQ: usize>(
+fn fail_receive_message<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &mut MemoryRegistry<'_, MRS>,
     psn: Psn,
     status: CompletionStatus,
 ) -> HandlerResult {
@@ -3044,8 +3165,8 @@ fn fail_receive_message<const SQ: usize, const RQ: usize, const CQ: usize>(
         Some(InboundMessage::Write { .. }) | None => None,
     };
     let reply = nak_reply(slot, psn, Aeth::NAK_INVALID_REQUEST);
-    let mut completions = work.map_or(0, |work| slot.finish_receive(work, status, 0));
-    completions += slot.enter_error();
+    let mut completions = work.map_or(0, |work| slot.finish_receive(memory, work, status, 0));
+    completions += slot.enter_error(memory);
     HandlerResult {
         reply: Some(reply),
         completions,
@@ -3053,13 +3174,14 @@ fn fail_receive_message<const SQ: usize, const RQ: usize, const CQ: usize>(
     }
 }
 
-fn fatal_request_error<const SQ: usize, const RQ: usize, const CQ: usize>(
+fn fatal_request_error<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &mut MemoryRegistry<'_, MRS>,
     psn: Psn,
     syndrome: u8,
 ) -> HandlerResult {
     let reply = nak_reply(slot, psn, syndrome);
-    let completions = slot.enter_error();
+    let completions = slot.enter_error(memory);
     HandlerResult {
         reply: Some(reply),
         completions,
@@ -3082,10 +3204,11 @@ fn handle_response_packet<const MRS: usize, const SQ: usize, const RQ: usize, co
     match packet.bth.opcode {
         Opcode::Acknowledge => {
             let Some(aeth) = packet.aeth else {
-                return fail_active_transport(slot);
+                return fail_active_transport(slot, memory);
             };
             handle_aeth_response(
                 slot,
+                memory,
                 aeth,
                 Psn::new_truncated(packet.bth.psn),
                 now,
@@ -3111,12 +3234,13 @@ fn handle_response_packet<const MRS: usize, const SQ: usize, const RQ: usize, co
         | Opcode::RdmaWriteLastWithImmediate
         | Opcode::RdmaWriteOnly
         | Opcode::RdmaWriteOnlyWithImmediate
-        | Opcode::RdmaReadRequest => fail_active_transport(slot),
+        | Opcode::RdmaReadRequest => fail_active_transport(slot, memory),
     }
 }
 
-fn handle_aeth_response<const SQ: usize, const RQ: usize, const CQ: usize>(
+fn handle_aeth_response<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &mut MemoryRegistry<'_, MRS>,
     aeth: Aeth,
     response_psn: Psn,
     now: u64,
@@ -3129,7 +3253,7 @@ fn handle_aeth_response<const SQ: usize, const RQ: usize, const CQ: usize>(
                 return HandlerResult::default();
             };
             if matches!(active.work.kind, WorkRequestKind::RdmaRead { .. }) {
-                return fail_active_transport(slot);
+                return fail_active_transport(slot, memory);
             }
             if active.transmitted_packets == 0
                 || matches!(
@@ -3141,7 +3265,7 @@ fn handle_aeth_response<const SQ: usize, const RQ: usize, const CQ: usize>(
                     rocev2_core::PsnOrdering::After
                 )
             {
-                return fail_active_transport(slot);
+                return fail_active_transport(slot, memory);
             }
             match slot.send_window.acknowledge(response_psn) {
                 AckAdvance::Advanced { .. } => {
@@ -3149,8 +3273,11 @@ fn handle_aeth_response<const SQ: usize, const RQ: usize, const CQ: usize>(
                         current.retry_budget.reset();
                     }
                     if slot.send_window.oldest_unacknowledged() == active.last_psn.next() {
-                        let completions =
-                            slot.finish_active(CompletionStatus::Success, active.work.sge.length);
+                        let completions = slot.finish_active(
+                            memory,
+                            CompletionStatus::Success,
+                            active.work.sge.length,
+                        );
                         HandlerResult {
                             reply: None,
                             completions,
@@ -3167,23 +3294,23 @@ fn handle_aeth_response<const SQ: usize, const RQ: usize, const CQ: usize>(
                     }
                 }
                 AckAdvance::Duplicate => HandlerResult::default(),
-                AckAdvance::Invalid => fail_active_transport(slot),
+                AckAdvance::Invalid => fail_active_transport(slot, memory),
             }
         }
         AethClass::RnrNak { timer } => {
             stats.rnr_naks = stats.rnr_naks.saturating_add(1);
-            schedule_rnr_retry(slot, timer, now, ticks_per_second, stats)
+            schedule_rnr_retry(slot, memory, timer, now, ticks_per_second, stats)
         }
-        AethClass::Nak(NakCode::PsnSequenceError) => schedule_transport_retry(slot, stats),
+        AethClass::Nak(NakCode::PsnSequenceError) => schedule_transport_retry(slot, memory, stats),
         AethClass::Nak(NakCode::InvalidRequest) => {
-            fail_active_and_enter_error(slot, CompletionStatus::RemoteInvalidRequest)
+            fail_active_and_enter_error(slot, memory, CompletionStatus::RemoteInvalidRequest)
         }
         AethClass::Nak(NakCode::RemoteAccessError) => {
-            fail_active_and_enter_error(slot, CompletionStatus::RemoteAccessError)
+            fail_active_and_enter_error(slot, memory, CompletionStatus::RemoteAccessError)
         }
         AethClass::Nak(NakCode::RemoteOperationError | NakCode::Unknown(_))
         | AethClass::Reserved { .. } => {
-            fail_active_and_enter_error(slot, CompletionStatus::TransportError)
+            fail_active_and_enter_error(slot, memory, CompletionStatus::TransportError)
         }
     }
 }
@@ -3200,7 +3327,7 @@ fn handle_read_response<const MRS: usize, const SQ: usize, const RQ: usize, cons
         return HandlerResult::default();
     };
     if !matches!(active.work.kind, WorkRequestKind::RdmaRead { .. }) {
-        return fail_active_transport(slot);
+        return fail_active_transport(slot, memory);
     }
 
     if let Some(aeth) = packet.aeth {
@@ -3231,17 +3358,17 @@ fn handle_read_response<const MRS: usize, const SQ: usize, const RQ: usize, cons
         active.packet_count,
     );
     if packet.bth.opcode != expected_opcode {
-        return fail_active_transport(slot);
+        return fail_active_transport(slot, memory);
     }
     let Some((offset, expected_length)) = segment_bounds(
         active.work.sge.length,
         slot.machine.config().path_mtu.bytes(),
         active.read_packets_received,
     ) else {
-        return fail_active_transport(slot);
+        return fail_active_transport(slot, memory);
     };
     if packet.payload.len() != expected_length {
-        return fail_active_transport(slot);
+        return fail_active_transport(slot, memory);
     }
     let Some(local_address) = active
         .work
@@ -3249,13 +3376,13 @@ fn handle_read_response<const MRS: usize, const SQ: usize, const RQ: usize, cons
         .address
         .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
     else {
-        return fail_active_and_enter_error(slot, CompletionStatus::LocalLengthError);
+        return fail_active_and_enter_error(slot, memory, CompletionStatus::LocalLengthError);
     };
     if memory
         .write_local(active.work.sge.lkey, local_address, packet.payload)
         .is_err()
     {
-        return fail_active_and_enter_error(slot, CompletionStatus::LocalProtectionError);
+        return fail_active_and_enter_error(slot, memory, CompletionStatus::LocalProtectionError);
     }
 
     let _ack = slot.send_window.acknowledge(received_psn);
@@ -3275,7 +3402,7 @@ fn handle_read_response<const MRS: usize, const SQ: usize, const RQ: usize, cons
 
     if completed {
         let byte_len = active.work.sge.length;
-        let completions = slot.finish_active(CompletionStatus::Success, byte_len);
+        let completions = slot.finish_active(memory, CompletionStatus::Success, byte_len);
         HandlerResult {
             reply: None,
             completions,
@@ -3286,8 +3413,9 @@ fn handle_read_response<const MRS: usize, const SQ: usize, const RQ: usize, cons
     }
 }
 
-fn schedule_transport_retry<const SQ: usize, const RQ: usize, const CQ: usize>(
+fn schedule_transport_retry<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &mut MemoryRegistry<'_, MRS>,
     stats: &mut RcEndpointStats,
 ) -> HandlerResult {
     let Some(active) = slot.active_request.as_mut() else {
@@ -3304,13 +3432,14 @@ fn schedule_transport_retry<const SQ: usize, const RQ: usize, const CQ: usize>(
             }
         }
         RetryDecision::Exhausted { .. } => {
-            fail_active_and_enter_error(slot, CompletionStatus::RetryExceeded)
+            fail_active_and_enter_error(slot, memory, CompletionStatus::RetryExceeded)
         }
     }
 }
 
-fn schedule_rnr_retry<const SQ: usize, const RQ: usize, const CQ: usize>(
+fn schedule_rnr_retry<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &mut MemoryRegistry<'_, MRS>,
     timer_code: u8,
     now: u64,
     ticks_per_second: u64,
@@ -3330,22 +3459,29 @@ fn schedule_rnr_retry<const SQ: usize, const RQ: usize, const CQ: usize>(
             HandlerResult::default()
         }
         RetryDecision::Exhausted { .. } => {
-            fail_active_and_enter_error(slot, CompletionStatus::RnrRetryExceeded)
+            fail_active_and_enter_error(slot, memory, CompletionStatus::RnrRetryExceeded)
         }
     }
 }
 
-fn fail_active_transport<const SQ: usize, const RQ: usize, const CQ: usize>(
+fn fail_active_transport<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &mut MemoryRegistry<'_, MRS>,
 ) -> HandlerResult {
-    fail_active_and_enter_error(slot, CompletionStatus::TransportError)
+    fail_active_and_enter_error(slot, memory, CompletionStatus::TransportError)
 }
 
-fn fail_active_and_enter_error<const SQ: usize, const RQ: usize, const CQ: usize>(
+fn fail_active_and_enter_error<
+    const MRS: usize,
+    const SQ: usize,
+    const RQ: usize,
+    const CQ: usize,
+>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &mut MemoryRegistry<'_, MRS>,
     status: CompletionStatus,
 ) -> HandlerResult {
-    let completions = fail_active_and_error(slot, status);
+    let completions = fail_active_and_error(slot, memory, status);
     HandlerResult {
         reply: None,
         completions,
@@ -3353,11 +3489,12 @@ fn fail_active_and_enter_error<const SQ: usize, const RQ: usize, const CQ: usize
     }
 }
 
-fn fail_active_and_error<const SQ: usize, const RQ: usize, const CQ: usize>(
+fn fail_active_and_error<const MRS: usize, const SQ: usize, const RQ: usize, const CQ: usize>(
     slot: &mut RcQpSlot<SQ, RQ, CQ>,
+    memory: &mut MemoryRegistry<'_, MRS>,
     status: CompletionStatus,
 ) -> usize {
-    let mut completions = slot.finish_active(status, 0);
-    completions += slot.enter_error();
+    let mut completions = slot.finish_active(memory, status, 0);
+    completions += slot.enter_error(memory);
     completions
 }
