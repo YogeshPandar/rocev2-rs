@@ -11,6 +11,11 @@
 #[cfg(all(feature = "afxdp", target_os = "linux"))]
 mod afxdp;
 #[allow(unsafe_code)]
+#[cfg(all(feature = "afxdp", target_os = "linux"))]
+mod xdp;
+#[cfg(all(feature = "afxdp", target_os = "linux"))]
+pub use xdp::XdpSteering;
+#[allow(unsafe_code)]
 #[cfg(all(target_os = "linux", any(feature = "raw-ipv4", feature = "afxdp")))]
 mod entropy;
 mod ethernet;

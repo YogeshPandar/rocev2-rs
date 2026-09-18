@@ -14,6 +14,8 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+static NEXT_SOCKET_ID: AtomicU32 = AtomicU32::new(1);
+
 const UMEM_FRAME_2K: u32 = 2048;
 const UMEM_FRAME_4K: u32 = 4096;
 const DEFAULT_FRAME_COUNT: u32 = 4096;
@@ -109,8 +111,9 @@ impl AfxdpConfig {
 /// Generation-checked `AF_XDP` receive frame handle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AfxdpRxFrame {
+    owner: u32,
     index: u32,
-    generation: u32,
+    generation: u64,
     ipv4_offset: u32,
     ipv4_length: u32,
 }
@@ -118,8 +121,9 @@ pub struct AfxdpRxFrame {
 /// Generation-checked `AF_XDP` transmit frame handle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AfxdpTxFrame {
+    owner: u32,
     index: u32,
-    generation: u32,
+    generation: u64,
 }
 
 /// `AF_XDP` backend counters maintained without allocation or locking.
@@ -137,6 +141,12 @@ pub struct AfxdpStatistics {
     pub rx_wakeup_errors: u64,
     /// TX wakeup syscalls that returned an error.
     pub tx_wakeup_errors: u64,
+    /// TX frames returned by the completion ring, not RC delivery acknowledgements.
+    pub reclaimed_tx_frames: u64,
+    /// Completion addresses that do not identify an outstanding TX descriptor.
+    pub invalid_completions: u64,
+    /// Frames retired instead of allowing a generation identifier to wrap.
+    pub retired_frames: u64,
 }
 
 /// Kernel-provided `AF_XDP` socket counters.
@@ -167,6 +177,10 @@ pub enum AfxdpError {
     InvalidKernelLayout,
     /// A shared ring producer/consumer distance exceeded its capacity.
     CorruptRing,
+    /// The completion ring returned a foreign, duplicate, or invalid address.
+    CorruptCompletion,
+    /// A socket or frame identity would wrap and invalidate stale-handle protection.
+    IdentityExhausted,
     /// A caller supplied an occupied batch output slot.
     OutputSlotOccupied,
     /// A receive frame is stale, duplicated, or not application-owned.
@@ -206,6 +220,8 @@ impl fmt::Display for AfxdpError {
             Self::CorruptRing => {
                 formatter.write_str("AF_XDP ring producer/consumer state is corrupt")
             }
+            Self::CorruptCompletion => formatter.write_str("invalid AF_XDP completion address"),
+            Self::IdentityExhausted => formatter.write_str("AF_XDP identity space exhausted"),
             Self::OutputSlotOccupied => {
                 formatter.write_str("batch output slot is already occupied")
             }
@@ -259,8 +275,15 @@ enum FrameState {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum FatalError {
+    Completion,
+    Identity,
+    System(i32),
+}
+
+#[derive(Clone, Copy, Debug)]
 struct FrameMeta {
-    generation: u32,
+    generation: u64,
     state: FrameState,
     seen_epoch: u64,
 }
@@ -579,6 +602,10 @@ impl<T: Copy> ConsumerRing<T> {
 /// An XDP program must steer matching traffic to this socket separately.
 #[derive(Debug)]
 pub struct AfxdpSocket {
+    // Unregister queue steering before closing the socket or releasing UMEM.
+    steering: Option<crate::xdp::QueueRegistration>,
+    owner: u32,
+    fatal_error: Option<FatalError>,
     descriptor: OwnedFd,
     rx_ring: ConsumerRing<libc::xdp_desc>,
     tx_ring: ProducerRing<libc::xdp_desc>,
@@ -600,6 +627,9 @@ impl AfxdpSocket {
     /// Create and bind an `AF_XDP` socket to one interface queue.
     pub fn bind(config: AfxdpConfig) -> Result<Self, AfxdpError> {
         let validated = ValidatedConfig::new(config)?;
+        let owner = NEXT_SOCKET_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| AfxdpError::IdentityExhausted)?;
         let descriptor = create_xdp_socket()?;
         let umem = Umem::new(config)?;
         register_umem(descriptor.as_raw_fd(), &umem)?;
@@ -673,6 +703,9 @@ impl AfxdpSocket {
         }
 
         let mut backend = Self {
+            steering: None,
+            owner,
+            fatal_error: None,
             descriptor,
             rx_ring,
             tx_ring,
@@ -702,7 +735,53 @@ impl AfxdpSocket {
             _ => {}
         }
         backend.wake_rx_if_needed();
+        backend.check_health()?;
         Ok(backend)
+    }
+
+    /// Register this bound socket in its interface's XSKMAP.
+    ///
+    /// The socket retains the map and program until it is detached or dropped.
+    /// A live queue registration is never replaced, even by another socket.
+    pub fn attach_steering(&mut self, steering: &crate::XdpSteering) -> Result<(), AfxdpError> {
+        self.check_health()?;
+        if self.steering.is_some() {
+            return Err(AfxdpError::InvalidConfig(
+                "socket already registered in XSKMAP",
+            ));
+        }
+        self.steering = Some(steering.register(
+            self.config.interface_index,
+            self.config.queue_id,
+            self.descriptor.as_raw_fd(),
+        )?);
+        Ok(())
+    }
+
+    /// Remove ingress steering while retaining socket, outstanding TX, and UMEM ownership.
+    pub fn detach_steering(&mut self) -> Result<(), AfxdpError> {
+        if let Some(registration) = &mut self.steering {
+            registration.unregister()?;
+        }
+        self.steering = None;
+        Ok(())
+    }
+
+    fn check_health(&self) -> Result<(), AfxdpError> {
+        match self.fatal_error {
+            None => Ok(()),
+            Some(FatalError::Completion) => Err(AfxdpError::CorruptCompletion),
+            Some(FatalError::Identity) => Err(AfxdpError::IdentityExhausted),
+            Some(FatalError::System(errno)) => {
+                Err(AfxdpError::Io(io::Error::from_raw_os_error(errno)))
+            }
+        }
+    }
+
+    fn retire_frame(&mut self, index: usize) {
+        self.frames[index].state = FrameState::Lost;
+        self.statistics.retired_frames = self.statistics.retired_frames.saturating_add(1);
+        self.fatal_error.get_or_insert(FatalError::Identity);
     }
 
     /// Return the configuration used to construct this socket.
@@ -802,11 +881,15 @@ impl AfxdpSocket {
             let Some(metadata) = self.frames.get_mut(index) else {
                 return Err(AfxdpError::InvalidReceiveFrame);
             };
-            if metadata.state != FrameState::AppRx
+            if frame.owner != self.owner
+                || metadata.state != FrameState::AppRx
                 || metadata.generation != frame.generation
                 || metadata.seen_epoch == epoch
             {
                 return Err(AfxdpError::InvalidReceiveFrame);
+            }
+            if metadata.generation == u64::MAX {
+                return Err(AfxdpError::IdentityExhausted);
             }
             metadata.seen_epoch = epoch;
             count += 1;
@@ -826,11 +909,15 @@ impl AfxdpSocket {
             let Some(metadata) = self.frames.get_mut(index) else {
                 return Err(AfxdpError::InvalidTransmitFrame);
             };
-            if metadata.state != FrameState::AppTx
+            if frame.owner != self.owner
+                || metadata.state != FrameState::AppTx
                 || metadata.generation != frame.generation
                 || metadata.seen_epoch == epoch
             {
                 return Err(AfxdpError::InvalidTransmitFrame);
+            }
+            if metadata.generation == u64::MAX {
+                return Err(AfxdpError::IdentityExhausted);
             }
             metadata.seen_epoch = epoch;
             count += 1;
@@ -841,14 +928,18 @@ impl AfxdpSocket {
     fn valid_rx_frame(&self, frame: AfxdpRxFrame) -> Option<usize> {
         let index = usize::try_from(frame.index).ok()?;
         let metadata = self.frames.get(index)?;
-        (metadata.state == FrameState::AppRx && metadata.generation == frame.generation)
+        (frame.owner == self.owner
+            && metadata.state == FrameState::AppRx
+            && metadata.generation == frame.generation)
             .then_some(index)
     }
 
     fn valid_tx_frame(&self, frame: AfxdpTxFrame) -> Option<usize> {
         let index = usize::try_from(frame.index).ok()?;
         let metadata = self.frames.get(index)?;
-        (metadata.state == FrameState::AppTx && metadata.generation == frame.generation)
+        (frame.owner == self.owner
+            && metadata.state == FrameState::AppTx
+            && metadata.generation == frame.generation)
             .then_some(index)
     }
 
@@ -906,6 +997,7 @@ impl AfxdpSocket {
         self.frames[index].state = FrameState::AppRx;
         (
             Some(AfxdpRxFrame {
+                owner: self.owner,
                 index: index as u32,
                 generation,
                 ipv4_offset: ipv4_offset as u32,
@@ -934,7 +1026,11 @@ impl AfxdpSocket {
             self.frames[index].state = FrameState::Lost;
             return false;
         }
-        self.frames[index].generation = self.frames[index].generation.wrapping_add(1);
+        let Some(generation) = self.frames[index].generation.checked_add(1) else {
+            self.retire_frame(index);
+            return false;
+        };
+        self.frames[index].generation = generation;
         self.frames[index].state = FrameState::FillRing;
         self.fill_ring.write(start, self.umem.frame_address(index));
         self.fill_ring.submit(start, 1);
@@ -953,7 +1049,8 @@ impl AfxdpSocket {
         let Some(metadata) = self.frames.get_mut(index) else {
             return Err(AfxdpError::InvalidTransmitFrame);
         };
-        if metadata.state != FrameState::AppTx
+        if frame.owner != self.owner
+            || metadata.state != FrameState::AppTx
             || metadata.generation != frame.generation
             || metadata.seen_epoch == epoch
         {
@@ -1001,6 +1098,12 @@ impl AfxdpSocket {
             // safety: pollfd points to one initialized entry for the duration of poll.
             let result = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
             if result >= 0 {
+                if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                    self.statistics.rx_wakeup_errors =
+                        self.statistics.rx_wakeup_errors.saturating_add(1);
+                    self.fatal_error
+                        .get_or_insert(FatalError::System(libc::EIO));
+                }
                 return;
             }
             let error = io::Error::last_os_error();
@@ -1008,6 +1111,9 @@ impl AfxdpSocket {
                 continue;
             }
             self.statistics.rx_wakeup_errors = self.statistics.rx_wakeup_errors.saturating_add(1);
+            self.fatal_error.get_or_insert(FatalError::System(
+                error.raw_os_error().unwrap_or(libc::EIO),
+            ));
             return;
         }
     }
@@ -1036,6 +1142,10 @@ impl AfxdpSocket {
                 continue;
             }
             self.statistics.tx_wakeup_errors = self.statistics.tx_wakeup_errors.saturating_add(1);
+            let errno = error.raw_os_error().unwrap_or(libc::EIO);
+            if !matches!(errno, libc::EAGAIN | libc::ENOBUFS | libc::EBUSY) {
+                self.fatal_error.get_or_insert(FatalError::System(errno));
+            }
             return;
         }
     }
@@ -1051,6 +1161,7 @@ impl PacketIo for AfxdpSocket {
     fn transmit_ipv4(&mut self, packet: &[u8]) -> Result<(), Self::Error> {
         validate_ipv4_length(packet.len(), self.maximum_ipv4_packet)?;
         validate_complete_ipv4(packet)?;
+        self.reap_tx_completions(self.config.completion_ring_size as usize)?;
 
         let mut frames = [None];
         if self.acquire_tx_batch(&mut frames)? == 0 {
@@ -1129,6 +1240,9 @@ impl PacketBatchIo for AfxdpSocket {
         if frames.iter().any(Option::is_some) {
             return Err(AfxdpError::OutputSlotOccupied);
         }
+        self.check_health()?;
+        self.wake_rx_if_needed();
+        self.check_health()?;
         let requested = usize_to_u32_saturating(frames.len());
         let (start, count) = self.rx_ring.peek(requested)?;
         let mut output_count = 0;
@@ -1177,7 +1291,7 @@ impl PacketBatchIo for AfxdpSocket {
                 continue;
             };
             let index = frame.index as usize;
-            self.frames[index].generation = self.frames[index].generation.wrapping_add(1);
+            self.frames[index].generation += 1;
             self.frames[index].state = FrameState::FillRing;
             self.fill_ring.write(
                 start.wrapping_add(ring_offset),
@@ -1194,6 +1308,7 @@ impl PacketBatchIo for AfxdpSocket {
         &mut self,
         frames: &mut [Option<Self::TxFrame>],
     ) -> Result<usize, Self::Error> {
+        self.check_health()?;
         if frames.iter().any(Option::is_some) {
             return Err(AfxdpError::OutputSlotOccupied);
         }
@@ -1214,6 +1329,7 @@ impl PacketBatchIo for AfxdpSocket {
             let metadata = &mut self.frames[index as usize];
             metadata.state = FrameState::AppTx;
             *slot = Some(AfxdpTxFrame {
+                owner: self.owner,
                 index,
                 generation: metadata.generation,
             });
@@ -1237,6 +1353,8 @@ impl PacketBatchIo for AfxdpSocket {
         &mut self,
         packets: &mut [TxPacket<Self::TxFrame>],
     ) -> Result<usize, SubmitError<Self::Error>> {
+        self.check_health()
+            .map_err(|error| SubmitError::new(0, error))?;
         let requested = usize_to_u32_saturating(packets.len());
         let (start, capacity) = self
             .tx_ring
@@ -1306,7 +1424,7 @@ impl PacketBatchIo for AfxdpSocket {
                 continue;
             };
             let index = frame.index as usize;
-            self.frames[index].generation = self.frames[index].generation.wrapping_add(1);
+            self.frames[index].generation += 1;
             self.frames[index].state = FrameState::FreeTx;
             self.tx_free.push(frame.index);
         }
@@ -1314,27 +1432,47 @@ impl PacketBatchIo for AfxdpSocket {
     }
 
     fn reap_tx_completions(&mut self, budget: usize) -> Result<usize, Self::Error> {
+        self.check_health()?;
         let requested = usize_to_u32_saturating(budget);
         let (start, count) = self.completion_ring.peek(requested)?;
         let mut reclaimed = 0;
         for offset in 0..count {
             let address = self.completion_ring.read(start.wrapping_add(offset));
-            let Some((index, _)) = self.umem.frame_index_for_range(address, 1) else {
+            let valid = self
+                .umem
+                .frame_index_for_range(address, 1)
+                .filter(|&(index, offset)| {
+                    index >= self.rx_frame_count
+                        && offset == self.umem.headroom
+                        && self.frames[index].state == FrameState::TxRing
+                });
+            let Some((index, _)) = valid else {
+                self.statistics.invalid_completions =
+                    self.statistics.invalid_completions.saturating_add(1);
+                self.fatal_error.get_or_insert(FatalError::Completion);
                 continue;
             };
-            if index < self.rx_frame_count || self.frames[index].state != FrameState::TxRing {
-                continue;
-            }
             if self.tx_free.len() == self.tx_free.capacity() {
-                self.frames[index].state = FrameState::Lost;
+                self.fatal_error.get_or_insert(FatalError::Completion);
                 continue;
             }
-            self.frames[index].generation = self.frames[index].generation.wrapping_add(1);
+            let Some(generation) = self.frames[index].generation.checked_add(1) else {
+                self.retire_frame(index);
+                continue;
+            };
+            self.frames[index].generation = generation;
             self.frames[index].state = FrameState::FreeTx;
             self.tx_free.push(index as u32);
             reclaimed += 1;
         }
         self.completion_ring.release(start, count);
+        self.statistics.reclaimed_tx_frames = self
+            .statistics
+            .reclaimed_tx_frames
+            .saturating_add(reclaimed as u64);
+        // A prior EAGAIN/ENOBUFS kick must not leave published descriptors stranded.
+        self.wake_tx_if_needed();
+        self.check_health()?;
         Ok(reclaimed)
     }
 }
@@ -1604,6 +1742,19 @@ fn ring_mapping_length<T>(
     let consumer_end = checked_mapping_end::<AtomicU32>(offsets.consumer, 1)?;
     let flags_end = checked_mapping_end::<AtomicU32>(offsets.flags, 1)?;
     let descriptor_end = checked_mapping_end::<T>(offsets.desc, entries as usize)?;
+    let spans = [
+        (offsets.producer as usize, producer_end),
+        (offsets.consumer as usize, consumer_end),
+        (offsets.flags as usize, flags_end),
+        (offsets.desc as usize, descriptor_end),
+    ];
+    for (index, &(start, end)) in spans.iter().enumerate() {
+        for &(other_start, other_end) in &spans[index + 1..] {
+            if start < other_end && other_start < end {
+                return Err(AfxdpError::InvalidKernelLayout);
+            }
+        }
+    }
     Ok(producer_end
         .max(consumer_end)
         .max(flags_end)
@@ -1697,5 +1848,207 @@ mod tests {
         };
         let length = ring_mapping_length::<libc::xdp_desc>(&offsets, 64).unwrap();
         assert_eq!(length, 128 + 64 * size_of::<libc::xdp_desc>());
+    }
+
+    fn test_ring<T>(size: u32) -> RingMemory<T> {
+        let offsets = libc::xdp_ring_offset {
+            producer: 0,
+            consumer: 64,
+            flags: 128,
+            desc: 192,
+        };
+        let mapping = Mapping::anonymous(
+            ring_mapping_length::<T>(&offsets, size).unwrap(),
+            UmemBacking::Regular,
+        )
+        .unwrap();
+        RingMemory {
+            producer: mapped_pointer(&mapping, offsets.producer).unwrap(),
+            consumer: mapped_pointer(&mapping, offsets.consumer).unwrap(),
+            flags: mapped_pointer(&mapping, offsets.flags).unwrap(),
+            descriptors: mapped_pointer(&mapping, offsets.desc).unwrap(),
+            _mapping: mapping,
+            size,
+            mask: size - 1,
+        }
+    }
+
+    fn simulated_socket() -> AfxdpSocket {
+        let mut config = test_config();
+        config.frame_count = 8;
+        config.tx_frame_count = 4;
+        config.headroom = 64;
+        config.fill_ring_size = 8;
+        config.completion_ring_size = 4;
+        let mut tx_free = Vec::with_capacity(4);
+        tx_free.extend(4..8);
+        AfxdpSocket {
+            steering: None,
+            owner: NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed),
+            fatal_error: None,
+            descriptor: std::fs::File::open("/dev/null").unwrap().into(),
+            rx_ring: ConsumerRing {
+                memory: test_ring(4),
+            },
+            tx_ring: ProducerRing {
+                memory: test_ring(4),
+            },
+            fill_ring: ProducerRing {
+                memory: test_ring(8),
+            },
+            completion_ring: ConsumerRing {
+                memory: test_ring(4),
+            },
+            umem: Umem::new(config).unwrap(),
+            frames: (0..8)
+                .map(|index| FrameMeta {
+                    generation: 0,
+                    seen_epoch: 0,
+                    state: if index < 4 {
+                        FrameState::FillRing
+                    } else {
+                        FrameState::FreeTx
+                    },
+                })
+                .collect(),
+            tx_free,
+            rx_frame_count: 4,
+            maximum_ipv4_packet: 4096 - 64 - ETHERNET_HEADER_LEN,
+            config,
+            zero_copy: false,
+            validation_epoch: 0,
+            statistics: AfxdpStatistics::default(),
+            _single_owner: PhantomData,
+        }
+    }
+
+    fn publish_completion(socket: &mut AfxdpSocket, address: u64) {
+        let memory = &socket.completion_ring.memory;
+        let producer = memory.producer().load(Ordering::Relaxed);
+        // safety: this test acts as the kernel producer of its private simulated ring.
+        unsafe {
+            ptr::write_volatile(memory.descriptor_pointer(producer), address);
+        }
+        memory
+            .producer()
+            .store(producer.wrapping_add(1), Ordering::Release);
+    }
+
+    fn submit_test_packet(socket: &mut AfxdpSocket) -> AfxdpTxFrame {
+        let mut frames = [None];
+        assert_eq!(socket.acquire_tx_batch(&mut frames).unwrap(), 1);
+        let handle = frames[0].take().unwrap();
+        let packet = socket.tx_ipv4_buffer(&handle).unwrap();
+        packet[..20].fill(0);
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&20_u16.to_be_bytes());
+        let mut packets = [TxPacket::new(handle, 20)];
+        assert_eq!(socket.submit_tx_batch(&mut packets).unwrap(), 1);
+        assert!(packets[0].frame().is_none());
+        handle
+    }
+
+    #[test]
+    fn handles_cannot_cross_socket_ownership() {
+        let mut first = simulated_socket();
+        let mut second = simulated_socket();
+        let mut a = [None];
+        let mut b = [None];
+        first.acquire_tx_batch(&mut a).unwrap();
+        second.acquire_tx_batch(&mut b).unwrap();
+        assert_eq!(a[0].unwrap().index, b[0].unwrap().index);
+        assert!(second.tx_ipv4_buffer(&a[0].unwrap()).is_err());
+        assert!(second.release_tx_batch(&mut a).is_err());
+        assert!(a[0].is_some());
+        first.release_tx_batch(&mut a).unwrap();
+        second.release_tx_batch(&mut b).unwrap();
+    }
+
+    #[test]
+    fn completion_reclaims_only_the_exact_outstanding_address() {
+        let mut socket = simulated_socket();
+        let handle = submit_test_packet(&mut socket);
+        assert_eq!(socket.tx_free.len(), 3);
+        assert!(socket.tx_ipv4_buffer(&handle).is_err());
+        let address = socket.umem.frame_address(handle.index as usize) + 64;
+        publish_completion(&mut socket, address);
+        assert_eq!(socket.reap_tx_completions(4).unwrap(), 1);
+        assert_eq!(socket.tx_free.len(), 4);
+        assert_eq!(socket.statistics().reclaimed_tx_frames, 1);
+        assert!(socket.tx_ipv4_buffer(&handle).is_err());
+        publish_completion(&mut socket, address);
+        assert!(matches!(
+            socket.reap_tx_completions(4),
+            Err(AfxdpError::CorruptCompletion)
+        ));
+        assert_eq!(socket.tx_free.len(), 4);
+        assert_eq!(socket.statistics().invalid_completions, 1);
+    }
+
+    #[test]
+    fn invalid_completion_offsets_never_free_a_live_tx_frame() {
+        for offset in [0, 1, 63, 65, 4095] {
+            let mut socket = simulated_socket();
+            let handle = submit_test_packet(&mut socket);
+            publish_completion(&mut socket, u64::from(handle.index) * 4096 + offset);
+            assert!(socket.reap_tx_completions(4).is_err());
+            assert_eq!(
+                socket.frames[handle.index as usize].state,
+                FrameState::TxRing
+            );
+            assert_eq!(socket.tx_free.len(), 3);
+        }
+    }
+
+    #[test]
+    fn generation_exhaustion_retires_instead_of_revalidating_stale_handles() {
+        let mut socket = simulated_socket();
+        let handle = submit_test_packet(&mut socket);
+        socket.frames[handle.index as usize].generation = u64::MAX;
+        let address = socket.umem.frame_address(handle.index as usize) + 64;
+        publish_completion(&mut socket, address);
+        assert!(matches!(
+            socket.reap_tx_completions(4),
+            Err(AfxdpError::IdentityExhausted)
+        ));
+        assert_eq!(socket.statistics().retired_frames, 1);
+        assert_eq!(socket.tx_free.len(), 3);
+    }
+
+    #[test]
+    fn ring_wraparound_preserves_capacity_and_publication_order() {
+        let mut ring = ProducerRing::<u64> {
+            memory: test_ring(4),
+        };
+        ring.memory
+            .producer()
+            .store(u32::MAX - 1, Ordering::Relaxed);
+        ring.memory
+            .consumer()
+            .store(u32::MAX - 1, Ordering::Relaxed);
+        let (start, count) = ring.reserve(9).unwrap();
+        assert_eq!(count, 4);
+        for index in 0..count {
+            ring.write(start.wrapping_add(index), u64::from(index));
+        }
+        ring.submit(start, count);
+        assert_eq!(ring.memory.producer().load(Ordering::Acquire), 2);
+        assert_eq!(ring.reserve(1).unwrap().1, 0);
+        ring.memory.consumer().store(2, Ordering::Release);
+        assert_eq!(ring.reserve(4).unwrap().1, 4);
+    }
+
+    #[test]
+    fn overlapping_kernel_ring_fields_are_rejected() {
+        let offsets = libc::xdp_ring_offset {
+            producer: 0,
+            consumer: 0,
+            flags: 4,
+            desc: 128,
+        };
+        assert!(matches!(
+            ring_mapping_length::<u64>(&offsets, 4),
+            Err(AfxdpError::InvalidKernelLayout)
+        ));
     }
 }
