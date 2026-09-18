@@ -1,6 +1,8 @@
 //! Black-box RC endpoint execution and reliability tests.
 
-use rocev2::io::{Frame, MockIo, PacketIo};
+use rocev2::io::{
+    FaultAction, FaultDirection, FaultInjectIo, FaultRule, Frame, MockIo, PacketIo,
+};
 use rocev2::memory::AccessFlags;
 use rocev2::wire::{Aeth, AethClass, Bth, Opcode, PacketSpec, Reth};
 use rocev2::{
@@ -10,6 +12,7 @@ use rocev2::{
 };
 
 type TestEndpoint<'a> = RcEndpoint<'a, MockIo, 2, 8, 8, 8, 16, 4>;
+type FaultEndpoint<'a> = RcEndpoint<'a, FaultInjectIo<MockIo, 8, 512>, 2, 8, 8, 8, 16, 4>;
 
 #[derive(Debug)]
 struct FailOnceIo {
@@ -71,6 +74,18 @@ fn endpoint<'a>() -> TestEndpoint<'a> {
             maximum_packet_size: 512,
             ticks_per_second: 1_000_000,
             memory_key_seed: 7,
+        },
+    )
+    .unwrap()
+}
+
+fn fault_endpoint<'a>() -> FaultEndpoint<'a> {
+    RcEndpoint::new(
+        FaultInjectIo::new(MockIo::new(512)),
+        RcEndpointConfig {
+            maximum_packet_size: 512,
+            ticks_per_second: 1_000_000,
+            memory_key_seed: 17,
         },
     )
     .unwrap()
@@ -687,6 +702,87 @@ fn timeout_retransmits_a_dropped_request() {
     );
     assert!(requester.stats().timeout_events >= 1);
     assert!(requester.stats().retransmissions >= 1);
+}
+
+#[test]
+fn fault_injector_drop_drives_real_timeout_retransmission() {
+    let mut source = [0x39_u8; 8];
+    let mut destination = [0_u8; 8];
+    let mut requester = fault_endpoint();
+    let mut responder = endpoint();
+    let source_mr = requester
+        .register_memory(&mut source, AccessFlags::NONE)
+        .unwrap();
+    let destination_mr = responder
+        .register_memory(&mut destination, AccessFlags::LOCAL_WRITE)
+        .unwrap();
+    let requester_qp = requester
+        .create_qp(qp_config(2, 3, 5, 50, [10, 4, 0, 1], [10, 4, 0, 2]))
+        .unwrap();
+    let responder_qp = responder
+        .create_qp(qp_config(3, 2, 50, 5, [10, 4, 0, 2], [10, 4, 0, 1]))
+        .unwrap();
+    ready(&mut requester, requester_qp);
+    ready(&mut responder, responder_qp);
+    responder
+        .post_receive(
+            responder_qp,
+            RecvWorkRequest::new(
+                2,
+                Sge::new(destination_mr.address(), 8, destination_mr.lkey()),
+            ),
+        )
+        .unwrap();
+    requester
+        .io_mut()
+        .push_rule(
+            FaultRule::new(FaultAction::Drop, FaultDirection::Transmit)
+                .opcode(Opcode::SendOnly)
+                .qpn(3)
+                .psn(5),
+        )
+        .unwrap();
+    requester
+        .post_work(
+            requester_qp,
+            WorkRequest::send(1, Sge::new(source_mr.address(), 8, source_mr.lkey()), true),
+        )
+        .unwrap();
+
+    let mut rx = [0_u8; 512];
+    let mut tx = [0_u8; 512];
+    requester.progress(0, &mut rx, &mut tx).unwrap();
+    assert_eq!(requester.io().statistics().dropped, 1);
+    assert!(requester.io_mut().inner_mut().pop_transmitted().is_none());
+
+    requester.progress(5, &mut rx, &mut tx).unwrap();
+    let retry = requester
+        .io_mut()
+        .inner_mut()
+        .pop_transmitted()
+        .expect("timeout retransmission");
+    responder
+        .io_mut()
+        .inject_receive(retry.as_bytes())
+        .unwrap();
+    responder.progress(5, &mut rx, &mut tx).unwrap();
+    let ack = responder.io_mut().pop_transmitted().expect("send ack");
+    requester
+        .io_mut()
+        .inner_mut()
+        .inject_receive(ack.as_bytes())
+        .unwrap();
+    requester.progress(6, &mut rx, &mut tx).unwrap();
+
+    assert_eq!(&destination, &source);
+    assert!(
+        requester
+            .poll_completion(requester_qp)
+            .unwrap()
+            .is_some_and(Completion::is_success)
+    );
+    assert_eq!(requester.stats().timeout_events, 1);
+    assert_eq!(requester.stats().retransmissions, 1);
 }
 
 #[test]
