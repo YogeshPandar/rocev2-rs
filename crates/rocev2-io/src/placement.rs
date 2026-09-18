@@ -84,6 +84,19 @@ pub fn pin_current_thread(cpu: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// One single-owner worker placement for an RX queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkerPlacement {
+    /// Zero-based endpoint shard identifier.
+    pub shard: u32,
+    /// Linux RX queue index assigned to the shard.
+    pub rx_queue: u32,
+    /// CPU on which the shard should be constructed and polled.
+    pub cpu: usize,
+    /// Device NUMA node when the kernel exposes one.
+    pub numa_node: Option<u32>,
+}
+
 /// Discovered NUMA placement hints for one network device.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NumaTopology {
@@ -98,14 +111,7 @@ pub struct NumaTopology {
 impl NumaTopology {
     /// Read sysfs placement hints and intersect them with the caller's cpuset.
     pub fn discover(interface: &str) -> io::Result<Self> {
-        if interface.is_empty()
-            || interface == "."
-            || interface == ".."
-            || interface.bytes().any(|b| b == b'/' || b == 0)
-        {
-            return Err(invalid("invalid network interface name"));
-        }
-        let root = Path::new("/sys/class/net").join(interface);
+        let root = interface_root(interface)?;
         let allowed = allowed_cpus()?;
         let node_path = root.join("device/numa_node");
         let device_node = match fs::read_to_string(node_path) {
@@ -150,6 +156,69 @@ impl NumaTopology {
     }
 }
 
+/// Build distinct queue/CPU placements for independent endpoint shards.
+///
+/// The function performs sysfs and affinity discovery only on the control path.
+/// It never changes affinity and never runs from packet processing.
+pub fn plan_workers(interface: &str, workers: usize) -> io::Result<Vec<WorkerPlacement>> {
+    if workers == 0 {
+        return Err(invalid("worker count must be nonzero"));
+    }
+    let topology = NumaTopology::discover(interface)?;
+    let root = interface_root(interface)?;
+    let mut queue_ids = Vec::new();
+    for entry in fs::read_dir(root.join("queues"))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(index) = name.strip_prefix("rx-") else {
+            continue;
+        };
+        let index = index
+            .parse::<u32>()
+            .map_err(|_| invalid("invalid RX queue index"))?;
+        queue_ids.push(index);
+    }
+    queue_ids.sort_unstable();
+    queue_ids.dedup();
+
+    let cpus = if topology.local_cpus.is_empty() {
+        allowed_cpus()?
+    } else {
+        topology.local_cpus.clone()
+    };
+    if workers > queue_ids.len() {
+        return Err(invalid("worker count exceeds available RX queues"));
+    }
+    if workers > cpus.len() {
+        return Err(invalid("worker count exceeds available CPUs"));
+    }
+
+    (0..workers)
+        .map(|shard| {
+            Ok(WorkerPlacement {
+                shard: u32::try_from(shard).map_err(|_| invalid("worker index exceeds u32"))?,
+                rx_queue: queue_ids[shard],
+                cpu: cpus[shard],
+                numa_node: topology.device_node,
+            })
+        })
+        .collect()
+}
+
+fn interface_root(interface: &str) -> io::Result<std::path::PathBuf> {
+    if interface.is_empty()
+        || interface == "."
+        || interface == ".."
+        || interface.bytes().any(|byte| byte == b'/' || byte == 0)
+    {
+        return Err(invalid("invalid network interface name"));
+    }
+    Ok(Path::new("/sys/class/net").join(interface))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +237,9 @@ mod tests {
             "18446744073709551616",
         ] {
             assert!(parse_cpu_list(invalid, 7).is_err());
+        }
+        for invalid in ["", ".", "..", "a/b", "a\0b"] {
+            assert!(interface_root(invalid).is_err());
         }
     }
 }

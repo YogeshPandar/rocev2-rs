@@ -1,0 +1,22 @@
+[package]
+name = "rocev2-rust-peer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+rocev2 = { path = "../../crates/rocev2", default-features = false, features = ["std", "raw-ipv4"] }
+
+[workspace]
+
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+module_name_repetitions = "allow"
