@@ -132,13 +132,31 @@ pub struct FaultStatistics {
     pub corrupted: u64,
 }
 
+/// fault-rule configuration failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FaultRuleError {
+    /// fixed fault rule table is full.
+    TableFull,
+    /// a rule cannot be configured to run zero times.
+    ZeroCount,
+}
+
+impl fmt::Display for FaultRuleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TableFull => formatter.write_str("fault rule table is full"),
+            Self::ZeroCount => formatter.write_str("fault rule count must be nonzero"),
+        }
+    }
+}
+
+impl core::error::Error for FaultRuleError {}
+
 /// fault-wrapper failure.
 #[derive(Debug)]
 pub enum FaultInjectError<E> {
     /// wrapped backend failure.
     Inner(E),
-    /// fixed fault rule table is full.
-    RuleTableFull,
     /// packet exceeds the wrapper's fixed packet storage.
     PacketTooLarge {
         /// observed packet length.
@@ -159,7 +177,6 @@ impl<E: fmt::Display> fmt::Display for FaultInjectError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Inner(error) => write!(formatter, "wrapped packet I/O failed: {error}"),
-            Self::RuleTableFull => formatter.write_str("fault rule table is full"),
             Self::PacketTooLarge { length, maximum } => {
                 write!(formatter, "packet length {length} exceeds fault buffer {maximum}")
             }
@@ -298,9 +315,12 @@ impl<I, const RULES: usize, const MAX_PACKET: usize> FaultInjectIo<I, RULES, MAX
     }
 
     /// install one rule in the first free fixed slot.
-    pub fn push_rule<E>(&mut self, rule: FaultRule) -> Result<(), FaultInjectError<E>> {
+    pub fn push_rule(&mut self, rule: FaultRule) -> Result<(), FaultRuleError> {
+        if rule.remaining == 0 {
+            return Err(FaultRuleError::ZeroCount);
+        }
         let Some(slot) = self.rules.iter_mut().find(|slot| slot.is_none()) else {
-            return Err(FaultInjectError::RuleTableFull);
+            return Err(FaultRuleError::TableFull);
         };
         *slot = Some(rule);
         Ok(())
@@ -315,9 +335,8 @@ impl<I, const RULES: usize, const MAX_PACKET: usize> FaultInjectIo<I, RULES, MAX
         &mut self,
         direction: FaultDirection,
         packet_number: u64,
-        packet: &[u8],
+        identity: Option<PacketIdentity>,
     ) -> Option<FaultAction> {
-        let identity = packet_identity(packet);
         for slot in &mut self.rules {
             let Some(rule) = *slot else {
                 continue;
@@ -369,6 +388,7 @@ where
         }
 
         if self.tx_reorder_waiting {
+            self.tx_packet_number = self.tx_packet_number.saturating_add(1);
             self.inner
                 .transmit_ipv4(packet)
                 .map_err(FaultInjectError::Inner)?;
@@ -390,7 +410,8 @@ where
         }
 
         self.tx_packet_number = self.tx_packet_number.saturating_add(1);
-        let action = self.take_action(FaultDirection::Transmit, self.tx_packet_number, packet);
+        let identity = packet_identity(packet);
+        let action = self.take_action(FaultDirection::Transmit, self.tx_packet_number, identity);
         let Some(action) = action else {
             return self
                 .inner
@@ -435,6 +456,7 @@ where
                 .map_err(FaultInjectError::Inner)?
             {
                 Some(length) => {
+                    self.rx_packet_number = self.rx_packet_number.saturating_add(1);
                     if length > MAX_PACKET {
                         return Err(FaultInjectError::PacketTooLarge {
                             length,
@@ -477,8 +499,9 @@ where
         }
 
         self.rx_packet_number = self.rx_packet_number.saturating_add(1);
+        let identity = packet_identity(&self.rx_scratch[..length]);
+        let action = self.take_action(FaultDirection::Receive, self.rx_packet_number, identity);
         let packet = &self.rx_scratch[..length];
-        let action = self.take_action(FaultDirection::Receive, self.rx_packet_number, packet);
         let Some(action) = action else {
             if output.len() < length {
                 return Err(FaultInjectError::OutputTooSmall {
@@ -594,7 +617,7 @@ mod tests {
     fn transmit_rules_match_packet_fields_without_allocation() {
         let inner = MockIo::new(64);
         let mut io = FaultInjectIo::<_, 4, 64>::new(inner);
-        io.push_rule::<crate::MockIoError>(
+        io.push_rule(
             FaultRule::new(FaultAction::Drop, FaultDirection::Transmit)
                 .opcode(Opcode::SendOnly)
                 .qpn(7)
@@ -615,7 +638,7 @@ mod tests {
         inner.inject_receive(&second).unwrap();
 
         let mut io = FaultInjectIo::<_, 4, 64>::new(inner);
-        io.push_rule::<crate::MockIoError>(
+        io.push_rule(
             FaultRule::new(FaultAction::Reorder, FaultDirection::Receive).packet_number(1),
         )
         .unwrap();
@@ -627,7 +650,7 @@ mod tests {
         assert_eq!(packet_identity(&output[..44]).unwrap().psn, 1);
 
         io.inner_mut().inject_receive(&first).unwrap();
-        io.push_rule::<crate::MockIoError>(
+        io.push_rule(
             FaultRule::new(FaultAction::Corrupt, FaultDirection::Receive).packet_number(3),
         )
         .unwrap();
