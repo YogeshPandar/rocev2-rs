@@ -2744,6 +2744,27 @@ fn prepare_request_batch_packet<const MRS: usize>(
     path: Ipv4Path,
 ) -> Result<PreparedWirePacket, RequestPacketError> {
     match active.work.kind {
+        WorkRequestKind::Send => prepare_segmented_batch_packet(
+            memory,
+            active,
+            mtu,
+            remote_qpn,
+            path,
+            TransferDirection::Send,
+            None,
+        ),
+        WorkRequestKind::RdmaWrite {
+            remote_address,
+            rkey,
+        } => prepare_segmented_batch_packet(
+            memory,
+            active,
+            mtu,
+            remote_qpn,
+            path,
+            TransferDirection::Write,
+            Some((remote_address, rkey)),
+        ),
         WorkRequestKind::RdmaRead {
             remote_address,
             rkey,
@@ -2766,58 +2787,56 @@ fn prepare_request_batch_packet<const MRS: usize>(
                 payload: PreparedPayload::Empty,
             })
         }
-        WorkRequestKind::Send | WorkRequestKind::RdmaWrite { .. } => {
-            let (offset, length) =
-                segment_bounds(active.work.sge.length, mtu, active.next_packet)
-                    .ok_or(RequestPacketError::ArithmeticOverflow)?;
-            let offset =
-                u64::try_from(offset).map_err(|_| RequestPacketError::ArithmeticOverflow)?;
-            let address = active
-                .work
-                .sge
-                .address
-                .checked_add(offset)
-                .ok_or(RequestPacketError::ArithmeticOverflow)?;
-            memory
-                .validate_local_read(active.work.sge.lkey, address, length)
-                .map_err(|_| RequestPacketError::LocalProtection)?;
-
-            let direction = match active.work.kind {
-                WorkRequestKind::Send => TransferDirection::Send,
-                WorkRequestKind::RdmaWrite { .. } => TransferDirection::Write,
-                WorkRequestKind::RdmaRead { .. } => unreachable!(),
-            };
-            let opcode = segmented_opcode(direction, active.next_packet, active.packet_count);
-            let mut bth = Bth::new(
-                opcode,
-                remote_qpn,
-                active.first_psn.wrapping_add(active.next_packet).value(),
-            );
-            bth.ack_request = active.next_packet + 1 == active.packet_count;
-            let reth = match active.work.kind {
-                WorkRequestKind::RdmaWrite {
-                    remote_address,
-                    rkey,
-                } if active.next_packet == 0 => Some(Reth {
-                    virtual_address: remote_address,
-                    remote_key: rkey,
-                    dma_length: active.work.sge.length,
-                }),
-                _ => None,
-            };
-            Ok(PreparedWirePacket {
-                path,
-                bth,
-                reth,
-                aeth: None,
-                payload: PreparedPayload::Local {
-                    lkey: active.work.sge.lkey,
-                    address,
-                    length,
-                },
-            })
-        }
     }
+}
+
+fn prepare_segmented_batch_packet<const MRS: usize>(
+    memory: &MemoryRegistry<'_, MRS>,
+    active: ActiveRequest,
+    mtu: usize,
+    remote_qpn: u32,
+    path: Ipv4Path,
+    direction: TransferDirection,
+    remote: Option<(u64, u32)>,
+) -> Result<PreparedWirePacket, RequestPacketError> {
+    let (offset, length) = segment_bounds(active.work.sge.length, mtu, active.next_packet)
+        .ok_or(RequestPacketError::ArithmeticOverflow)?;
+    let offset = u64::try_from(offset).map_err(|_| RequestPacketError::ArithmeticOverflow)?;
+    let address = active
+        .work
+        .sge
+        .address
+        .checked_add(offset)
+        .ok_or(RequestPacketError::ArithmeticOverflow)?;
+    memory
+        .validate_local_read(active.work.sge.lkey, address, length)
+        .map_err(|_| RequestPacketError::LocalProtection)?;
+
+    let opcode = segmented_opcode(direction, active.next_packet, active.packet_count);
+    let mut bth = Bth::new(
+        opcode,
+        remote_qpn,
+        active.first_psn.wrapping_add(active.next_packet).value(),
+    );
+    bth.ack_request = active.next_packet + 1 == active.packet_count;
+    let reth = remote.and_then(|(remote_address, rkey)| {
+        (active.next_packet == 0).then_some(Reth {
+            virtual_address: remote_address,
+            remote_key: rkey,
+            dma_length: active.work.sge.length,
+        })
+    });
+    Ok(PreparedWirePacket {
+        path,
+        bth,
+        reth,
+        aeth: None,
+        payload: PreparedPayload::Local {
+            lkey: active.work.sge.lkey,
+            address,
+            length,
+        },
+    })
 }
 
 fn mark_request_packet_sent<const SQ: usize, const RQ: usize, const CQ: usize>(
