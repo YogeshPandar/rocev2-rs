@@ -773,7 +773,13 @@ fn fault_injector_drop_drives_real_timeout_retransmission() {
         .unwrap();
     requester.progress(6, &mut rx, &mut tx).unwrap();
 
-    assert_eq!(&destination, &source);
+    assert_eq!(
+        responder
+            .memory_registry()
+            .local_read_slice(destination_mr.lkey(), destination_mr.address(), 8)
+            .unwrap(),
+        &[0x39; 8]
+    );
     assert!(
         requester
             .poll_completion(requester_qp)
