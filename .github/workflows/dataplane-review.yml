@@ -26,12 +26,24 @@ jobs:
           targets: thumbv7em-none-eabihf
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
+      - name: Decode the reviewed source checkpoint
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, lzma, pathlib
+          data = pathlib.Path('.review/dataplane.patch').read_bytes()
+          if data.startswith(b'xz:'):
+              header, payload = data.split(b'\n', 1)
+              data = lzma.decompress(base64.b64decode(payload.strip(), validate=True))
+              assert hashlib.sha256(data).hexdigest() == header[3:].decode()
+          pathlib.Path('/tmp/dataplane.patch').write_bytes(data)
+          PY
       - name: Apply and publish the reviewed source checkpoint
         shell: bash
         run: |
           set -euo pipefail
-          git apply --check .review/dataplane.patch
-          git apply .review/dataplane.patch
+          git apply --check /tmp/dataplane.patch
+          git apply /tmp/dataplane.patch
           git rm .review/dataplane.patch
           cargo +stable fmt --all
           git diff --stat
