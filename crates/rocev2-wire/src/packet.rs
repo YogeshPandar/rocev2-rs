@@ -97,7 +97,12 @@ impl<'a> PacketRef<'a> {
                     actual: input.len(),
                 });
             }
-            let value = u32::from_be_bytes(input[cursor..end].try_into().expect("slice length"));
+            let value = u32::from_be_bytes([
+                input[cursor],
+                input[cursor + 1],
+                input[cursor + 2],
+                input[cursor + 3],
+            ]);
             cursor = end;
             Some(value)
         } else {
@@ -127,11 +132,12 @@ impl<'a> PacketRef<'a> {
         if options.require_zero_padding && padding.iter().any(|&byte| byte != 0) {
             return Err(WireError::NonZeroPadding);
         }
-        let icrc = u32::from_le_bytes(
-            input[padding_end..]
-                .try_into()
-                .expect("four-byte ICRC slice"),
-        );
+        let icrc = u32::from_le_bytes([
+            input[padding_end],
+            input[padding_end + 1],
+            input[padding_end + 2],
+            input[padding_end + 3],
+        ]);
 
         Ok(Self {
             bth,

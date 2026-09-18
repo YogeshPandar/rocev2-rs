@@ -4,7 +4,6 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::marker::PhantomData;
 
 use rocev2::io::FixedPacketIo;
 use rocev2::wire::Opcode;
@@ -73,7 +72,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-struct Measurement(PhantomData<*mut ()>);
+struct Measurement {
+    active: bool,
+}
 
 impl Measurement {
     fn begin() -> Self {
@@ -81,18 +82,22 @@ impl Measurement {
             assert!(cell.get().is_none(), "nested allocation measurement");
             cell.set(Some(Counts::default()));
         });
-        Self(PhantomData)
+        Self { active: true }
     }
 
-    fn finish(self) -> Counts {
-        COUNTS.with(|cell| cell.take().unwrap())
+    fn finish(mut self) -> Counts {
+        let counts = COUNTS.with(|cell| cell.take().unwrap());
+        self.active = false;
+        counts
     }
 }
 
 impl Drop for Measurement {
     fn drop(&mut self) {
-        // A panic must not leave counting enabled on the test thread.
-        let _ = COUNTS.try_with(|cell| cell.set(None));
+        if self.active {
+            // A panic must not leave counting enabled on the test thread.
+            let _ = COUNTS.try_with(|cell| cell.set(None));
+        }
     }
 }
 
@@ -172,7 +177,119 @@ fn progress(endpoint: &mut Endpoint<'_>, now: u64, batch: bool) {
     }
 }
 
-fn workload(batch: bool, mut forward: Fault, mut reverse: Fault, rnr: bool) {
+#[derive(Clone, Copy)]
+struct CaseContext {
+    left_qp: QpHandle,
+    right_qp: QpHandle,
+    source_mr: rocev2::MemoryRegion,
+    read_mr: rocev2::MemoryRegion,
+    target_mr: rocev2::MemoryRegion,
+}
+
+struct RunState {
+    batch: bool,
+    rnr: bool,
+    forward: Fault,
+    reverse: Fault,
+    now: u64,
+}
+
+fn run_case(
+    left: &mut Endpoint<'_>,
+    right: &mut Endpoint<'_>,
+    context: CaseContext,
+    state: &mut RunState,
+    size: u32,
+    operation: u8,
+) {
+    let receive = RecvWorkRequest::new(
+        8,
+        Sge::new(context.target_mr.address(), size, context.target_mr.lkey()),
+    );
+    if operation == 0 && !state.rnr {
+        assert_eq!(
+            right
+                .post_receive_batch(context.right_qp, &[receive])
+                .unwrap(),
+            1
+        );
+    }
+    let sge = Sge::new(context.source_mr.address(), size, context.source_mr.lkey());
+    let work = match operation {
+        0 => WorkRequest::send(9, sge, true),
+        1 => WorkRequest::write(
+            9,
+            sge,
+            context.target_mr.address(),
+            context.target_mr.rkey(),
+            true,
+        ),
+        _ => WorkRequest::read(
+            9,
+            Sge::new(context.read_mr.address(), size, context.read_mr.lkey()),
+            context.target_mr.address(),
+            context.target_mr.rkey(),
+            true,
+        ),
+    };
+    assert_eq!(left.post_work_batch(context.left_qp, &[work]).unwrap(), 1);
+
+    let mut completed = false;
+    for step in 0..20_000 {
+        if operation == 0 && state.rnr && step == 32 {
+            right.post_receive(context.right_qp, receive).unwrap();
+        }
+        progress(left, state.now, state.batch);
+        transfer(left, right, &mut state.forward);
+        progress(right, state.now, state.batch);
+        transfer(right, left, &mut state.reverse);
+        state.now += 1;
+        let mut completions =
+            [Completion::failure(0, CompletionOpcode::Send, CompletionStatus::Flushed); 4];
+        let count = left
+            .poll_completions(context.left_qp, &mut completions)
+            .unwrap();
+        if count != 0 {
+            assert_eq!(count, 1);
+            assert!(completions[0].is_success(), "{:?}", completions[0]);
+            completed = true;
+            break;
+        }
+    }
+    assert!(
+        completed,
+        "operation did not complete within its test deadline"
+    );
+
+    if operation == 0 {
+        assert!(
+            right
+                .poll_completion(context.right_qp)
+                .unwrap()
+                .unwrap()
+                .is_success()
+        );
+        assert!(right.poll_completion(context.right_qp).unwrap().is_none());
+    }
+    let mut actual = [0; 769];
+    let result = if operation == 2 {
+        left.memory_registry_mut().read_local(
+            context.read_mr.lkey(),
+            context.read_mr.address(),
+            &mut actual[..size as usize],
+        )
+    } else {
+        right.memory_registry_mut().read_local(
+            context.target_mr.lkey(),
+            context.target_mr.address(),
+            &mut actual[..size as usize],
+        )
+    };
+    result.unwrap();
+    assert!(actual[..size as usize].iter().all(|&value| value == 0x5a));
+}
+
+fn workload(batch: bool, forward: Fault, reverse: Fault, rnr: bool) {
     let mut source = [0x5a; 769];
     let mut destination = [0; 769];
     let mut readback = [0; 769];
@@ -190,93 +307,32 @@ fn workload(batch: bool, mut forward: Fault, mut reverse: Fault, rnr: bool) {
             AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
         )
         .unwrap();
-    let left_qp = connect(&mut left, 2, 3);
-    let right_qp = connect(&mut right, 3, 2);
+    let context = CaseContext {
+        left_qp: connect(&mut left, 2, 3),
+        right_qp: connect(&mut right, 3, 2),
+        source_mr,
+        read_mr,
+        target_mr,
+    };
+    let mut state = RunState {
+        batch,
+        rnr,
+        forward,
+        reverse,
+        now: 0,
+    };
     let measurement = Measurement::begin();
-    let mut now = 0;
     for size in [0, 1, 255, 256, 257, 769] {
         for operation in 0..3 {
-            let receive =
-                RecvWorkRequest::new(8, Sge::new(target_mr.address(), size, target_mr.lkey()));
-            if operation == 0 && !rnr {
-                assert_eq!(right.post_receive_batch(right_qp, &[receive]).unwrap(), 1);
-            }
-            let sge = Sge::new(source_mr.address(), size, source_mr.lkey());
-            let work = match operation {
-                0 => WorkRequest::send(9, sge, true),
-                1 => WorkRequest::write(9, sge, target_mr.address(), target_mr.rkey(), true),
-                _ => WorkRequest::read(
-                    9,
-                    Sge::new(read_mr.address(), size, read_mr.lkey()),
-                    target_mr.address(),
-                    target_mr.rkey(),
-                    true,
-                ),
-            };
-            assert_eq!(left.post_work_batch(left_qp, &[work]).unwrap(), 1);
-            let mut completed = false;
-            for step in 0..20_000 {
-                if operation == 0 && rnr && step == 32 {
-                    right.post_receive(right_qp, receive).unwrap();
-                }
-                progress(&mut left, now, batch);
-                transfer(&mut left, &mut right, &mut forward);
-                progress(&mut right, now, batch);
-                transfer(&mut right, &mut left, &mut reverse);
-                now += 1;
-                let mut completions =
-                    [Completion::failure(0, CompletionOpcode::Send, CompletionStatus::Flushed); 4];
-                let count = left.poll_completions(left_qp, &mut completions).unwrap();
-                if count != 0 {
-                    assert_eq!(count, 1);
-                    assert!(completions[0].is_success(), "{:?}", completions[0]);
-                    completed = true;
-                    break;
-                }
-            }
-            assert!(
-                completed,
-                "operation did not complete within its test deadline"
-            );
-            if operation == 0 {
-                assert!(
-                    right
-                        .poll_completion(right_qp)
-                        .unwrap()
-                        .unwrap()
-                        .is_success()
-                );
-                assert!(right.poll_completion(right_qp).unwrap().is_none());
-            }
-            let mut actual = [0; 769];
-            if operation == 2 {
-                left.memory_registry_mut()
-                    .read_local(
-                        read_mr.lkey(),
-                        read_mr.address(),
-                        &mut actual[..size as usize],
-                    )
-                    .unwrap();
-            } else {
-                right
-                    .memory_registry_mut()
-                    .read_local(
-                        target_mr.lkey(),
-                        target_mr.address(),
-                        &mut actual[..size as usize],
-                    )
-                    .unwrap();
-            }
-            assert!(actual[..size as usize].iter().all(|&value| value == 0x5a));
+            run_case(&mut left, &mut right, context, &mut state, size, operation);
         }
     }
     if rnr {
         assert!(left.stats().rnr_naks > 0);
     }
-    assert!(matches!(forward, Fault::None));
-    assert!(matches!(reverse, Fault::None));
-    let counts = measurement.finish();
-    assert_eq!(counts, Counts::default());
+    assert!(matches!(state.forward, Fault::None));
+    assert!(matches!(state.reverse, Fault::None));
+    assert_eq!(measurement.finish(), Counts::default());
 }
 
 #[test]
