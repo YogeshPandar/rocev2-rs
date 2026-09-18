@@ -199,7 +199,7 @@ fn exchange_metadata(
 fn barrier(stream: &mut TcpStream) -> io::Result<()> {
     let mut token = [0_u8; 1];
     stream.read_exact(&mut token)?;
-    if token != [b'R'] {
+    if token != *b"R" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid ready token",
@@ -321,7 +321,7 @@ fn drive_until_completion(
     let deadline = Instant::now() + CONTROL_TIMEOUT;
     let origin = Instant::now();
     loop {
-        if let Some(completion) = endpoint.poll_completion(qp)? {
+        if let Some(completion) = endpoint.poll_completion(*qp)? {
             validate_completion(
                 completion,
                 u64::from(iteration),
@@ -350,7 +350,7 @@ fn wait_done_while_progressing(
     let mut token = [0_u8; 1];
     let result = loop {
         match stream.read(&mut token) {
-            Ok(1) if token == [b'D'] => break Ok(()),
+            Ok(1) if token == *b"D" => break Ok(()),
             Ok(1) => {
                 break Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -363,7 +363,7 @@ fn wait_done_while_progressing(
                     "control peer closed",
                 ));
             }
-            Ok(_) => unreachable!("one-byte buffer cannot report a larger read"),
+            Ok(_) => break Err(io::Error::new(io::ErrorKind::InvalidData, "invalid control read")),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => break Err(error),
         }
@@ -383,23 +383,35 @@ fn wait_done_while_progressing(
     Ok(())
 }
 
-fn run_iteration(
-    stream: &mut TcpStream,
-    endpoint: &mut PeerEndpoint<'_>,
+struct IterationContext<'a, 'b> {
+    stream: &'a mut TcpStream,
+    endpoint: &'a mut PeerEndpoint<'b>,
     qp: rocev2::QpHandle,
     region: RegionHandle,
     remote: RcConnectionInfo,
     config: Config,
-    iteration: u32,
-    payload: &mut [u8],
-    rx: &mut [u8],
-    tx: &mut [u8],
-) -> Result<(), DynError> {
+    payload: &'a mut [u8],
+    rx: &'a mut [u8],
+    tx: &'a mut [u8],
+}
+
+fn run_iteration(context: &mut IterationContext<'_, '_>, iteration: u32) -> Result<(), DynError> {
+    let IterationContext {
+        stream,
+        endpoint,
+        qp,
+        region,
+        remote,
+        config,
+        payload,
+        rx,
+        tx,
+    } = context;
     let local_source = (config.requester && config.operation != Operation::Read)
         || (!config.requester && config.operation == Operation::Read);
     set_payload(
         endpoint,
-        region,
+        *region,
         usize::try_from(config.size)?,
         iteration,
         local_source,
@@ -408,7 +420,7 @@ fn run_iteration(
 
     if !config.requester && config.operation == Operation::Send {
         endpoint.post_receive(
-            qp,
+            *qp,
             RecvWorkRequest::new(
                 u64::from(iteration),
                 Sge::new(region.address(), config.size, region.lkey()),
@@ -418,12 +430,12 @@ fn run_iteration(
 
     barrier(stream)?;
     if config.requester {
-        post_requester(endpoint, qp, region, remote, config, iteration)?;
-        drive_until_completion(endpoint, qp, config, iteration, rx, tx)?;
+        post_requester(endpoint, *qp, *region, *remote, *config, iteration)?;
+        drive_until_completion(endpoint, *qp, *config, iteration, rx, tx)?;
         if config.operation == Operation::Read {
             verify_payload(
                 endpoint,
-                region,
+                *region,
                 usize::try_from(config.size)?,
                 iteration,
                 payload,
@@ -432,7 +444,7 @@ fn run_iteration(
         stream.write_all(b"D")?;
         let mut token = [0_u8; 1];
         stream.read_exact(&mut token)?;
-        if token != [b'K'] {
+        if token != *b"K" {
             return Err("invalid acknowledgement token".into());
         }
     } else {
@@ -440,7 +452,7 @@ fn run_iteration(
         if config.operation != Operation::Read {
             verify_payload(
                 endpoint,
-                region,
+                *region,
                 usize::try_from(config.size)?,
                 iteration,
                 payload,
@@ -499,19 +511,19 @@ fn run(config: Config) -> Result<(), DynError> {
     let mut payload = vec![0_u8; size];
     let mut rx = vec![0_u8; packet_size];
     let mut tx = vec![0_u8; packet_size];
+    let mut context = IterationContext {
+        stream: &mut stream,
+        endpoint: &mut endpoint,
+        qp,
+        region,
+        remote,
+        config,
+        payload: &mut payload,
+        rx: &mut rx,
+        tx: &mut tx,
+    };
     for iteration in 0..config.iterations {
-        run_iteration(
-            &mut stream,
-            &mut endpoint,
-            qp,
-            region,
-            remote,
-            config,
-            iteration,
-            &mut payload,
-            &mut rx,
-            &mut tx,
-        )?;
+        run_iteration(&mut context, iteration)?;
     }
 
     println!(
