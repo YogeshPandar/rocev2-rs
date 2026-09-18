@@ -75,7 +75,7 @@ impl FaultRule {
     /// match one destination queue-pair number.
     #[must_use]
     pub const fn qpn(mut self, qpn: u32) -> Self {
-        self.qpn = Some(qpn);
+        self.qpn = Some(qpn & 0x00ff_ffff);
         self
     }
 
