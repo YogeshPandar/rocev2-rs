@@ -3334,6 +3334,7 @@ fn handle_read_response<const MRS: usize, const SQ: usize, const RQ: usize, cons
         if !matches!(aeth.class(), AethClass::Ack { .. }) {
             return handle_aeth_response(
                 slot,
+                memory,
                 aeth,
                 Psn::new_truncated(packet.bth.psn),
                 now,
