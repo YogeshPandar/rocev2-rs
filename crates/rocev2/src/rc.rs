@@ -1215,12 +1215,9 @@ where
             return Ok(ReceiveOne::Dropped);
         }
 
-        let decoded = match decode_ipv4_packet(&buffer[..length]) {
-            Ok(decoded) => decoded,
-            Err(_) => {
-                self.record_invalid_drop();
-                return Ok(ReceiveOne::Dropped);
-            }
+        let Ok(decoded) = decode_ipv4_packet(&buffer[..length]) else {
+            self.record_invalid_drop();
+            return Ok(ReceiveOne::Dropped);
         };
         self.stats.receive_packets = self.stats.receive_packets.saturating_add(1);
         self.stats.receive_bytes = self
@@ -1999,12 +1996,9 @@ where
                 self.record_invalid_drop();
                 continue;
             }
-            let decoded = match decode_ipv4_packet(packet) {
-                Ok(decoded) => decoded,
-                Err(_) => {
-                    self.record_invalid_drop();
-                    continue;
-                }
+            let Ok(decoded) = decode_ipv4_packet(packet) else {
+                self.record_invalid_drop();
+                continue;
             };
             let packet_length = packet.len();
             self.stats.receive_packets = self.stats.receive_packets.saturating_add(1);
