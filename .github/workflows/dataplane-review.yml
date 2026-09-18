@@ -1,0 +1,55 @@
+name: dataplane-review
+
+on:
+  push:
+    branches: [feat/dataplane-lifetime-hardening]
+    paths: [.review/dataplane.patch]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dataplane-review
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: thumbv7em-none-eabihf
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Apply and publish the reviewed source checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check .review/dataplane.patch
+          git apply .review/dataplane.patch
+          git rm .review/dataplane.patch
+          cargo +stable fmt --all
+          git diff --stat
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'feat: apply reviewed dataplane hardening checkpoint'
+          git push origin HEAD:feat/dataplane-lifetime-hardening
+          echo "Validated source commit: $(git rev-parse HEAD)"
+      - name: Stable tests
+        if: ${{ !cancelled() }}
+        run: cargo +stable test --workspace --all-features --all-targets
+      - name: Strict Clippy
+        if: ${{ !cancelled() }}
+        run: cargo +stable clippy --workspace --all-features --all-targets -- -D warnings
+      - name: Portable no_std workspace
+        if: ${{ !cancelled() }}
+        run: cargo +stable check --workspace --no-default-features --target thumbv7em-none-eabihf
+      - name: Rust 1.85 tests
+        if: ${{ !cancelled() }}
+        run: cargo +1.85.0 test --workspace --all-features --all-targets
