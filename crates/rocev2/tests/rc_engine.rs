@@ -173,12 +173,11 @@ fn rc_qpn_index_tracks_collision_removal_and_reconfiguration() {
         .io_mut()
         .inject_receive(&packet[..old_length])
         .unwrap();
-    assert!(matches!(
-        endpoint.progress(0, &mut receive, &mut transmit),
-        Err(rocev2::PollError::Api(
-            rocev2::ApiError::UnknownDestinationQpn(3)
-        ))
-    ));
+    let dropped = endpoint.progress(0, &mut receive, &mut transmit).unwrap();
+    assert_eq!(dropped.received_packets, 1);
+    assert_eq!(dropped.transmitted_packets, 0);
+    assert_eq!(endpoint.stats().unknown_qp_packets, 1);
+    assert_eq!(endpoint.stats().dropped_packets, 1);
 
     let new_length = encode_ipv4_packet(
         peer_path,
@@ -199,6 +198,59 @@ fn rc_qpn_index_tracks_collision_removal_and_reconfiguration() {
     let progress = endpoint.progress(1, &mut receive, &mut transmit).unwrap();
     assert_eq!(progress.received_packets, 1);
     assert_eq!(progress.transmitted_packets, 1);
+}
+
+#[test]
+fn malformed_and_wrong_peer_packets_are_contained_as_drops() {
+    let mut endpoint = endpoint();
+    let qp = endpoint
+        .create_qp(qp_config(2, 3, 10, 30, [192, 0, 2, 1], [192, 0, 2, 2]))
+        .unwrap();
+    ready(&mut endpoint, qp);
+
+    let mut packet = [0_u8; 512];
+    let mut receive = [0_u8; 512];
+    let mut transmit = [0_u8; 512];
+    let wrong_peer = Ipv4Path::new([192, 0, 2, 99], [192, 0, 2, 1], 49_152);
+    let length = encode_ipv4_packet(
+        wrong_peer,
+        PacketSpec {
+            bth: Bth::new(Opcode::SendOnly, 2, 30),
+            reth: None,
+            aeth: None,
+            immediate_data: None,
+            payload: b"x",
+        },
+        &mut packet,
+    )
+    .unwrap();
+    endpoint.io_mut().inject_receive(&packet[..length]).unwrap();
+    let progress = endpoint.progress(0, &mut receive, &mut transmit).unwrap();
+    assert_eq!(progress.received_packets, 1);
+    assert_eq!(progress.transmitted_packets, 0);
+    assert_eq!(endpoint.stats().peer_mismatch_packets, 1);
+    assert_eq!(endpoint.stats().dropped_packets, 1);
+
+    let correct_peer = Ipv4Path::new([192, 0, 2, 2], [192, 0, 2, 1], 49_152);
+    let length = encode_ipv4_packet(
+        correct_peer,
+        PacketSpec {
+            bth: Bth::new(Opcode::SendOnly, 2, 30),
+            reth: None,
+            aeth: None,
+            immediate_data: None,
+            payload: b"x",
+        },
+        &mut packet,
+    )
+    .unwrap();
+    packet[length - 1] ^= 1;
+    endpoint.io_mut().inject_receive(&packet[..length]).unwrap();
+    let progress = endpoint.progress(1, &mut receive, &mut transmit).unwrap();
+    assert_eq!(progress.received_packets, 1);
+    assert_eq!(progress.transmitted_packets, 0);
+    assert_eq!(endpoint.stats().invalid_packets, 1);
+    assert_eq!(endpoint.stats().dropped_packets, 2);
 }
 
 fn read_replay_qps(requester: &mut TestEndpoint<'_>, responder: &mut TestEndpoint<'_>) -> QpHandle {
