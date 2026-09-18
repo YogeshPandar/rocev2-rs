@@ -2,7 +2,7 @@ name: qualification-review
 on:
   push:
     branches: [feat/qualification-interop-scale]
-    paths: [.review/qualification.patch]
+    paths: [.review/qualification.patch, .github/workflows/qualification-review.yml]
 permissions:
   contents: write
   pull-requests: write
@@ -27,16 +27,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          if test -f .review/qualification.patch; then
+            python3 - <<'PY'
           import base64, hashlib, lzma, pathlib
           header, encoded = pathlib.Path('.review/qualification.patch').read_bytes().split(b'\n', 1)
           patch = lzma.decompress(base64.b64decode(encoded.strip(), validate=True))
           assert header == b'xz:' + hashlib.sha256(patch).hexdigest().encode()
           pathlib.Path('/tmp/qualification.patch').write_bytes(patch)
           PY
-          git apply --check /tmp/qualification.patch
-          git apply /tmp/qualification.patch
-          git rm .review/qualification.patch
+            git apply --check --exclude='.github/workflows/*' --exclude='*/__pycache__/*' /tmp/qualification.patch
+            git apply --exclude='.github/workflows/*' --exclude='*/__pycache__/*' /tmp/qualification.patch
+            git rm .review/qualification.patch
+          fi
           cargo +stable fmt --all
           cargo +1.85.0 generate-lockfile
           for manifest in tools/qualification/Cargo.toml fuzz/Cargo.toml; do
@@ -48,8 +50,10 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
-          git commit -m 'feat: apply qualification implementation checkpoint'
-          git push origin HEAD:feat/qualification-interop-scale
+          if ! git diff --cached --quiet; then
+            git commit -m 'feat: apply qualification implementation checkpoint'
+            git push origin HEAD:feat/qualification-interop-scale
+          fi
           git archive --format=zip HEAD > /tmp/qualification-source.zip
           echo "Reviewed source: $(git rev-parse HEAD)"
       - name: Compile and test
