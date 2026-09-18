@@ -35,9 +35,14 @@ fn measure(mut operation: impl FnMut(), iterations: u64) -> Duration {
 
 fn report(name: &str, iterations: u64, elapsed: Duration) {
     let total_ns = elapsed.as_nanos();
-    let ns_per_op = total_ns as f64 / iterations as f64;
+    let scaled = total_ns
+        .saturating_mul(1_000)
+        .checked_div(u128::from(iterations))
+        .unwrap_or(u128::MAX);
+    let whole = scaled / 1_000;
+    let fraction = scaled % 1_000;
     println!(
-        "{{\"benchmark\":\"{name}\",\"iterations\":{iterations},\"elapsed_ns\":{total_ns},\"ns_per_op\":{ns_per_op:.3}}}"
+        "{{\"benchmark\":\"{name}\",\"iterations\":{iterations},\"elapsed_ns\":{total_ns},\"ns_per_op\":{whole}.{fraction:03}}}"
     );
 }
 
@@ -148,20 +153,25 @@ fn shard_scale(shards: u32) -> Result<(), DynError> {
     Ok(())
 }
 
+fn json_node(node: Option<u32>) -> String {
+    node.map_or_else(|| String::from("null"), |value| value.to_string())
+}
+
 fn placement(interface: &str, workers: usize) -> Result<(), DynError> {
     let topology = NumaTopology::discover(interface)?;
     let allowed = allowed_cpus()?;
+    let topology_node = json_node(topology.device_node);
     println!(
-        "{{\"interface\":\"{interface}\",\"numa_node\":{:?},\"rx_queues\":{},\"allowed_cpus\":{},\"local_cpus\":{}}}",
-        topology.device_node,
+        "{{\"interface\":\"{interface}\",\"numa_node\":{topology_node},\"rx_queues\":{},\"allowed_cpus\":{},\"local_cpus\":{}}}",
         topology.rx_queues,
         allowed.len(),
         topology.local_cpus.len()
     );
     for worker in plan_workers(interface, workers)? {
+        let worker_node = json_node(worker.numa_node);
         println!(
-            "{{\"shard\":{},\"rx_queue\":{},\"cpu\":{},\"numa_node\":{:?}}}",
-            worker.shard, worker.rx_queue, worker.cpu, worker.numa_node
+            "{{\"shard\":{},\"rx_queue\":{},\"cpu\":{},\"numa_node\":{worker_node}}}",
+            worker.shard, worker.rx_queue, worker.cpu
         );
     }
     Ok(())
