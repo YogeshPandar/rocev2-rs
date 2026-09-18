@@ -11,7 +11,7 @@ use std::sync::Arc;
 const XDP_PASS: i32 = 2;
 const REDIRECT_MAP: i32 = 51;
 
-/// Interface-scoped RoCEv2 steering and queue-to-socket map.
+/// Interface-scoped `RoCEv2` steering and queue-to-socket map.
 ///
 /// Native XDP links require Linux 5.9 or newer and a supporting driver. Existing
 /// XDP attachments are never replaced. Only untagged, unfragmented IPv4 packets
@@ -184,7 +184,7 @@ fn create_map(queues: u32) -> io::Result<OwnedFd> {
 }
 
 fn load_program(map_fd: RawFd) -> io::Result<OwnedFd> {
-    let instructions = steering_program(map_fd);
+    let instructions = steering_program(map_fd)?;
     let mut log = vec![0_u8; 65_536];
     let license = b"Dual MIT/GPL\0";
     let mut attr = empty_attr();
@@ -220,7 +220,7 @@ fn insn(code: u8, destination: u8, source: u8, offset: i16, immediate: i32) -> b
 
 // Opcodes follow the Linux eBPF ISA. Packet accesses have a dominating data_end check.
 // xdp_md offsets 0/4/16 are data/data_end/rx_queue_index from linux/bpf.h.
-fn steering_program(map_fd: RawFd) -> Vec<bpf_insn> {
+fn steering_program(map_fd: RawFd) -> io::Result<Vec<bpf_insn>> {
     let mut code = vec![
         insn(0xbf, 6, 1, 0, 0), // r6 = context
         insn(0x61, 2, 6, 0, 0), // r2 = data
@@ -267,10 +267,15 @@ fn steering_program(map_fd: RawFd) -> Vec<bpf_insn> {
     let pass = code.len() - 2;
     for (index, instruction) in code.iter_mut().enumerate() {
         if instruction.off == -1 {
-            instruction.off = (pass - index - 1) as i16;
+            let offset = pass
+                .checked_sub(index)
+                .and_then(|distance| distance.checked_sub(1))
+                .ok_or_else(|| io::Error::other("invalid XDP branch target"))?;
+            instruction.off = i16::try_from(offset)
+                .map_err(|_| io::Error::other("XDP branch target exceeds eBPF range"))?;
         }
     }
-    code
+    Ok(code)
 }
 
 #[cfg(test)]
@@ -279,7 +284,7 @@ mod tests {
 
     #[test]
     fn steering_branches_only_target_the_pass_exit() {
-        let code = steering_program(7);
+        let code = steering_program(7).unwrap();
         assert_eq!(size_of::<bpf_insn>(), 8);
         for (index, instruction) in code.iter().enumerate() {
             if instruction.off > 0 && instruction.code & 7 == 5 {
