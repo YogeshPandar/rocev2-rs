@@ -722,7 +722,9 @@ fn fault_injector_drop_drives_real_timeout_retransmission() {
     let responder_qp = responder
         .create_qp(qp_config(3, 2, 50, 5, [10, 4, 0, 2], [10, 4, 0, 1]))
         .unwrap();
-    ready(&mut requester, requester_qp);
+    requester.transition_qp(requester_qp, QpState::Init).unwrap();
+    requester.transition_qp(requester_qp, QpState::Rtr).unwrap();
+    requester.transition_qp(requester_qp, QpState::Rts).unwrap();
     ready(&mut responder, responder_qp);
     responder
         .post_receive(
