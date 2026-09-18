@@ -321,7 +321,7 @@ fn drive_until_completion(
     let deadline = Instant::now() + CONTROL_TIMEOUT;
     let origin = Instant::now();
     loop {
-        if let Some(completion) = endpoint.poll_completion(*qp)? {
+        if let Some(completion) = endpoint.poll_completion(qp)? {
             validate_completion(
                 completion,
                 u64::from(iteration),
@@ -465,7 +465,7 @@ fn run_iteration(context: &mut IterationContext<'_, '_>, iteration: u32) -> Resu
         }
         if config.operation == Operation::Send {
             let completion = endpoint
-                .poll_completion(qp)?
+                .poll_completion(*qp)?
                 .ok_or("SEND responder is missing its receive completion")?;
             validate_completion(
                 completion,
