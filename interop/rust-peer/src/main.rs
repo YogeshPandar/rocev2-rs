@@ -400,7 +400,10 @@ struct IterationContext<'a, 'b> {
     tx: &'a mut [u8],
 }
 
-fn run_iteration(context: &mut IterationContext<'_, '_>, iteration: u32) -> Result<(), DynError> {
+fn run_iteration(
+    context: &mut IterationContext<'_, '_>,
+    iteration: u32,
+) -> Result<Option<u64>, DynError> {
     let IterationContext {
         stream,
         endpoint,
@@ -434,9 +437,12 @@ fn run_iteration(context: &mut IterationContext<'_, '_>, iteration: u32) -> Resu
     }
 
     barrier(stream)?;
+    let mut latency = None;
     if config.requester {
+        let operation_start = Instant::now();
         post_requester(endpoint, *qp, *region, *remote, *config, iteration)?;
         drive_until_completion(endpoint, *qp, *config, iteration, rx, tx)?;
+        latency = Some(tick(operation_start));
         if config.operation == Operation::Read {
             verify_payload(
                 endpoint,
@@ -476,7 +482,18 @@ fn run_iteration(context: &mut IterationContext<'_, '_>, iteration: u32) -> Resu
         }
         stream.write_all(b"K")?;
     }
-    Ok(())
+    Ok(latency)
+}
+
+fn percentile(samples: &[u64], numerator: usize, denominator: usize) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let rank = samples
+        .len()
+        .saturating_mul(numerator)
+        .div_ceil(denominator);
+    samples[rank.saturating_sub(1).min(samples.len() - 1)]
 }
 
 fn run(config: Config) -> Result<(), DynError> {
@@ -527,18 +544,41 @@ fn run(config: Config) -> Result<(), DynError> {
         rx: &mut rx,
         tx: &mut tx,
     };
+    let mut latencies = Vec::with_capacity(if config.requester {
+        usize::try_from(config.iterations)?
+    } else {
+        0
+    });
+    let run_start = Instant::now();
     for iteration in 0..config.iterations {
-        run_iteration(&mut context, iteration)?;
+        if let Some(latency) = run_iteration(&mut context, iteration)? {
+            latencies.push(latency);
+        }
     }
-
-    println!(
-        "{{\"peer\":\"rocev2-rs\",\"operation\":{},\"requester\":{},\"size\":{},\"iterations\":{},\"mtu\":{},\"status\":\"pass\"}}",
-        config.operation.code(),
-        config.requester,
-        config.size,
-        config.iterations,
-        config.mtu
-    );
+    let elapsed = tick(run_start);
+    let payload_bytes = u64::from(config.size).saturating_mul(u64::from(config.iterations));
+    if config.requester {
+        latencies.sort_unstable();
+        println!(
+            "{{\"peer\":\"rocev2-rs\",\"operation\":{},\"requester\":true,\"size\":{},\"iterations\":{},\"mtu\":{},\"elapsed_ns\":{elapsed},\"payload_bytes\":{payload_bytes},\"p50_ns\":{},\"p95_ns\":{},\"p99_ns\":{},\"p999_ns\":{},\"status\":\"pass\"}}",
+            config.operation.code(),
+            config.size,
+            config.iterations,
+            config.mtu,
+            percentile(&latencies, 50, 100),
+            percentile(&latencies, 95, 100),
+            percentile(&latencies, 99, 100),
+            percentile(&latencies, 999, 1000)
+        );
+    } else {
+        println!(
+            "{{\"peer\":\"rocev2-rs\",\"operation\":{},\"requester\":false,\"size\":{},\"iterations\":{},\"mtu\":{},\"elapsed_ns\":{elapsed},\"payload_bytes\":{payload_bytes},\"status\":\"pass\"}}",
+            config.operation.code(),
+            config.size,
+            config.iterations,
+            config.mtu
+        );
+    }
     Ok(())
 }
 
