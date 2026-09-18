@@ -11,6 +11,14 @@ concurrency:
   group: safety-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  fuzz-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +stable test --locked --manifest-path fuzz/Cargo.toml --lib
   fuzz:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
