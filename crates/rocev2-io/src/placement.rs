@@ -43,7 +43,7 @@ pub fn parse_cpu_list(text: &str, maximum_cpu: usize) -> io::Result<Vec<usize>> 
 
 /// Return the current thread's allowed CPUs, accounting for cpuset restrictions.
 ///
-/// Uses libc's fixed cpu_set_t. Kernels requiring a larger affinity mask return
+/// Uses libc's fixed `cpu_set_t`. Kernels requiring a larger affinity mask return
 /// their error rather than truncating the allowed CPU set.
 pub fn allowed_cpus() -> io::Result<Vec<usize>> {
     // SAFETY: zero is a valid empty cpu_set_t representation.
