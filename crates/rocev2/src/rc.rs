@@ -39,7 +39,9 @@ pub struct RcEndpointConfig {
     pub maximum_packet_size: usize,
     /// Frequency of the monotonic tick value supplied to [`RcEndpoint::progress`].
     pub ticks_per_second: u64,
-    /// Per-endpoint seed used to diversify lkeys and rkeys.
+    /// Deterministic development seed for registrations made without a key generator.
+    ///
+    /// Production code should use `RcEndpoint::register_memory_with_key_generator`.
     pub memory_key_seed: u32,
 }
 
@@ -680,7 +682,11 @@ where
         self.memory.access()
     }
 
-    /// Register an exclusive application buffer.
+    /// Register an exclusive application buffer with deterministic development keys.
+    ///
+    /// This path is reproducible and is intended for tests and controlled development.
+    /// Production code should use [`Self::register_memory_with_key_generator`] with an
+    /// externally seeded cryptographic key source.
     pub fn register_memory(
         &mut self,
         memory: &'memory mut [u8],
