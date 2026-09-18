@@ -2,7 +2,7 @@ name: release-code-review
 on:
   push:
     branches: [feat/release-code-hardening]
-    paths: [.review/release-code.patch]
+    paths: [.review/release-code.patch, .github/workflows/release-code-review.yml]
 permissions:
   contents: write
   pull-requests: write
@@ -48,7 +48,7 @@ jobs:
           done
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A
+          git add -A -- . ':(exclude).github/workflows/**'
           git commit -m 'feat: add executable release qualification tooling'
           git push origin HEAD:feat/release-code-hardening
       - name: Workspace tests
