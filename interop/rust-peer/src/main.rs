@@ -67,7 +67,7 @@ impl From<AfxdpError> for PeerIoError {
 enum PeerIo {
     Raw(RawIpv4Socket),
     Afxdp {
-        socket: AfxdpSocket,
+        socket: Box<AfxdpSocket>,
         _steering: XdpSteering,
     },
 }
@@ -264,7 +264,7 @@ fn open_io(config: Config, packet_size: usize) -> Result<PeerIo, DynError> {
                 .into());
             }
             Ok(PeerIo::Afxdp {
-                socket,
+                socket: Box::new(socket),
                 _steering: steering,
             })
         }
