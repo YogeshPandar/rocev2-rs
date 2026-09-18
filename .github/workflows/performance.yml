@@ -1,0 +1,51 @@
+name: performance-qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      interface:
+        description: NIC interface used for placement discovery
+        required: true
+      workers:
+        description: Number of queue-owner workers
+        required: false
+        default: "1"
+      iterations:
+        description: Microbenchmark iterations
+        required: false
+        default: "5000000"
+      shards:
+        description: Power-of-two QPN shards for the 100K-QP plan
+        required: false
+        default: "128"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-qualification-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  performance:
+    runs-on: [self-hosted, linux, x64, rocev2-perf]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: Build qualification driver
+        run: cargo +1.85.0 build --locked --release --manifest-path tools/qualification/Cargo.toml
+      - name: Record environment
+        run: |
+          mkdir -p qualification-results
+          interop/scripts/capture-environment.sh "${{ inputs.interface }}" > qualification-results/environment.txt
+      - name: Run qualification drivers
+        run: |
+          binary=tools/qualification/target/release/rocev2-qualification
+          "$binary" micro "${{ inputs.iterations }}" | tee qualification-results/micro.jsonl
+          "$binary" scale "${{ inputs.shards }}" | tee qualification-results/scale.jsonl
+          "$binary" placement "${{ inputs.interface }}" "${{ inputs.workers }}" | tee qualification-results/placement.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: performance-qualification-${{ github.sha }}
+          path: qualification-results
