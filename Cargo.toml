@@ -7,7 +7,7 @@ members = [
     "crates/rocev2-io",
     "crates/rocev2",
 ]
-exclude = ["fuzz"]
+exclude = ["fuzz", "interop/rust-peer", "tools/qualification"]
 
 [workspace.package]
 version = "0.1.0"

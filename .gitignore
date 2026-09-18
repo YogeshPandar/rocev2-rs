@@ -7,3 +7,7 @@
 *.profdata
 perf.data*
 .DS_Store
+
+**/__pycache__/
+interop/results/
+qualification-results/

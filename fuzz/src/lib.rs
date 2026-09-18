@@ -12,7 +12,7 @@ pub fn wire_decode(data: &[u8]) {
     let _ = PacketRef::parse(data, ParseOptions::STRICT);
     let _ = decode_ipv4_packet(data);
     let _ = rocev2::RcConnectionInfo::decode(data);
-    let mut crc = Icrc::new();
+    let mut crc = Icrc::with_seed(u32::MAX);
     crc.update(data);
     let mut reference = 0xffff_ffffu32;
     for byte in data {

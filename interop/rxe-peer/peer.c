@@ -15,10 +15,22 @@
 #include <unistd.h>
 
 #define DEADLINE_MS 20000u
-static uint64_t milliseconds(void) {
+static uint64_t nanoseconds(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now)) { perror("clock_gettime"); exit(1); }
-    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+    return (uint64_t)now.tv_sec * 1000000000u + (uint64_t)now.tv_nsec;
+}
+static uint64_t milliseconds(void) { return nanoseconds() / 1000000u; }
+static int compare_u64(const void *left, const void *right) {
+    const uint64_t a = *(const uint64_t *)left, b = *(const uint64_t *)right;
+    return (a > b) - (a < b);
+}
+static uint64_t percentile(const uint64_t *samples, uint32_t count, uint32_t numerator, uint32_t denominator) {
+    if (!count) return 0;
+    uint64_t rank = ((uint64_t)count * numerator + denominator - 1u) / denominator;
+    if (!rank) rank = 1;
+    if (rank > count) rank = count;
+    return samples[rank - 1u];
 }
 static bool number(const char *text, uint64_t maximum, uint64_t *out) {
     if (!text[0] || text[0] == '-' || text[0] == '+') return false;
@@ -153,6 +165,7 @@ int main(int argc, char **argv) {
     struct ibv_device **devices = NULL;
     struct ibv_context *ctx = NULL; struct ibv_pd *pd = NULL; struct ibv_cq *cq = NULL;
     struct ibv_qp *qp = NULL; struct ibv_mr *mr = NULL; uint8_t *buffer = NULL;
+    uint64_t *samples = NULL;
     int listener = -1, fd = -1, result = 1;
     devices = ibv_get_device_list(NULL);
     if (!devices) goto cleanup;
@@ -164,7 +177,8 @@ int main(int argc, char **argv) {
     if (gid < 0) goto cleanup;
     pd = ibv_alloc_pd(ctx); cq = ibv_create_cq(ctx, 16, NULL, NULL, 0);
     buffer = calloc(size ? size : 1, 1);
-    if (!pd || !cq || !buffer) goto cleanup;
+    samples = requester ? calloc(iterations, sizeof(*samples)) : NULL;
+    if (!pd || !cq || !buffer || (requester && !samples)) goto cleanup;
     mr = ibv_reg_mr(pd, buffer, size ? size : 1, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
     if (!mr) goto cleanup;
     struct ibv_qp_init_attr init = { .send_cq = cq, .recv_cq = cq, .qp_type = IBV_QPT_RC,
@@ -193,6 +207,7 @@ int main(int argc, char **argv) {
     if (!exchange_bytes(fd, encoded, sizeof(encoded), true) || !exchange_bytes(fd, encoded, sizeof(encoded), false) ||
         !info_decode(encoded, sizeof(encoded), &remote) || remote.length < size ||
         memcmp(remote.ipv4, &client.sin_addr, 4) || !connect_qp(qp, port, gid, &local, &remote)) goto cleanup;
+    const uint64_t run_start = nanoseconds();
     for (uint32_t iteration = 0; iteration < iterations; ++iteration) {
         bool source = (requester && operation != 3) || (!requester && operation == 3);
         for (size_t i = 0; i < size; ++i) buffer[i] = source ? pattern(i, iteration) : 0xa5;
@@ -204,11 +219,13 @@ int main(int argc, char **argv) {
         // Both QPs are RTS and SEND receives are posted before the barrier.
         if (!token(fd, 'R', true) || !token(fd, 'R', false)) goto cleanup;
         if (requester) {
+            const uint64_t operation_start = nanoseconds();
             struct ibv_send_wr send = { .wr_id = iteration, .sg_list = &sge, .num_sge = 1, .send_flags = IBV_SEND_SIGNALED }, *bad;
             send.opcode = operation == 1 ? IBV_WR_SEND : operation == 2 ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
             if (operation != 1) { send.wr.rdma.remote_addr = remote.address; send.wr.rdma.rkey = remote.rkey; }
             enum ibv_wc_opcode expected = operation == 1 ? IBV_WC_SEND : operation == 2 ? IBV_WC_RDMA_WRITE : IBV_WC_RDMA_READ;
             if (ibv_post_send(qp, &send, &bad) || !completion(cq, expected, iteration, size, false)) goto cleanup;
+            samples[iteration] = nanoseconds() - operation_start;
         } else if (operation == 1 && !completion(cq, IBV_WC_RECV, iteration, size, true)) goto cleanup;
         if (!requester && !token(fd, 'D', false)) goto cleanup;
         if (!source) for (size_t i = 0; i < size; ++i) if (buffer[i] != pattern(i, iteration)) {
@@ -217,8 +234,18 @@ int main(int argc, char **argv) {
         if (requester) { if (!token(fd, 'D', true) || !token(fd, 'K', false)) goto cleanup; }
         else if (!token(fd, 'K', true)) goto cleanup;
     }
-    printf("{\"peer\":\"verbs\",\"operation\":%u,\"requester\":%s,\"size\":%u,\"iterations\":%u,\"mtu\":%u,\"status\":\"pass\"}\n",
-           operation, requester ? "true" : "false", size, iterations, mtu);
+    const uint64_t elapsed = nanoseconds() - run_start;
+    const uint64_t payload_bytes = (uint64_t)size * iterations;
+    if (requester) {
+        qsort(samples, iterations, sizeof(*samples), compare_u64);
+        printf("{\"peer\":\"verbs\",\"operation\":%u,\"requester\":true,\"size\":%u,\"iterations\":%u,\"mtu\":%u,\"elapsed_ns\":%" PRIu64 ",\"payload_bytes\":%" PRIu64 ",\"p50_ns\":%" PRIu64 ",\"p95_ns\":%" PRIu64 ",\"p99_ns\":%" PRIu64 ",\"p999_ns\":%" PRIu64 ",\"status\":\"pass\"}\n",
+               operation, size, iterations, mtu, elapsed, payload_bytes,
+               percentile(samples, iterations, 50, 100), percentile(samples, iterations, 95, 100),
+               percentile(samples, iterations, 99, 100), percentile(samples, iterations, 999, 1000));
+    } else {
+        printf("{\"peer\":\"verbs\",\"operation\":%u,\"requester\":false,\"size\":%u,\"iterations\":%u,\"mtu\":%u,\"elapsed_ns\":%" PRIu64 ",\"payload_bytes\":%" PRIu64 ",\"status\":\"pass\"}\n",
+               operation, size, iterations, mtu, elapsed, payload_bytes);
+    }
     result = 0;
 cleanup:
     if (result) fprintf(stderr, "peer failed: %s\n", strerror(errno));
@@ -227,6 +254,7 @@ cleanup:
     // Stop DMA before deregistration or freeing memory; fail closed on teardown errors.
     if (qp && ibv_destroy_qp(qp)) return 1;
     if (mr && ibv_dereg_mr(mr)) return 1;
+    free(samples);
     free(buffer);
     if (cq && ibv_destroy_cq(cq)) result = 1;
     if (pd && ibv_dealloc_pd(pd)) result = 1;

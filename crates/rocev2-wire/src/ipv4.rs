@@ -77,8 +77,8 @@ impl Ipv4Header {
             fragment_offset: flags_fragment & 0x1fff,
             ttl: input[8],
             protocol: input[9],
-            source: input[12..16].try_into().expect("slice length"),
-            destination: input[16..20].try_into().expect("slice length"),
+            source: [input[12], input[13], input[14], input[15]],
+            destination: [input[16], input[17], input[18], input[19]],
         })
     }
 

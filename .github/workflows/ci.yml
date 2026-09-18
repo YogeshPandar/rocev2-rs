@@ -48,3 +48,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-features
+
+  hosted-tools:
+    name: hosted qualification tools
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install verbs headers
+        run: sudo apt-get update -qq && sudo apt-get install -y libibverbs-dev
+      - name: Rust peer
+        run: |
+          cargo +stable fmt --manifest-path interop/rust-peer/Cargo.toml -- --check
+          cargo +stable test --locked --manifest-path interop/rust-peer/Cargo.toml
+          cargo +stable clippy --locked --manifest-path interop/rust-peer/Cargo.toml --all-targets -- -D warnings
+          cargo +1.85.0 check --locked --manifest-path interop/rust-peer/Cargo.toml
+      - name: Qualification drivers
+        run: |
+          cargo +stable fmt --manifest-path tools/qualification/Cargo.toml -- --check
+          cargo +stable test --locked --manifest-path tools/qualification/Cargo.toml
+          cargo +stable clippy --locked --manifest-path tools/qualification/Cargo.toml --all-targets -- -D warnings
+          cargo +1.85.0 check --locked --manifest-path tools/qualification/Cargo.toml
+      - name: Verbs peer and scripts
+        run: |
+          make -C interop/rxe-peer clean test
+          python3 -m unittest discover -s interop/tests -v
+          bash -n interop/scripts/*.sh

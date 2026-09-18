@@ -1,36 +1,59 @@
 # Implementation status
 
-This document separates implemented, continuously tested behavior from work that requires Linux/kernel facilities or physical RoCE hardware and therefore must not be claimed before qualification runs exist.
+This document separates code that exists from qualification evidence that must be collected on Linux hosts or physical RoCE hardware.
 
-## Implemented and covered by workspace tests
+## Implemented and continuously checked
 
-- `no_std`, allocation-free BTH, RETH, AETH, opcode, IPv4/UDP, packet, and ICRC codecs with strict length, reserved-bit, padding, header-combination, and ICRC validation.
-- 24-bit serial PSN arithmetic, cumulative ACK windows, multi-PSN RDMA READ reservations, QP transitions, retry budgets, RNR timing, and fixed rings.
-- Fixed-capacity memory registration with full-width lkey/rkey lookup, caller-supplied production key generation, stale-key rejection, posted-work MR leases, permission/range/overflow checks, and an audited raw-memory boundary.
-- Backend-neutral complete-IPv4 packet I/O, deterministic mock I/O, allocation-free fault injection, a fixed-capacity batch backend, and a Linux raw-IPv4 correctness backend.
-- Fixed-capacity posted SEND, RDMA WRITE, and RDMA READ execution with one SGE per WQE and CQ generation for requester and receive work.
-- Fixed-capacity open-addressed local-QPN routing with collision-safe deletion, bounded load factor, and no per-packet scan across the QP table.
-- Fixed-capacity requester/responder ready queues and an indexed deadline min-heap, eliminating QP-table scans for transmit work and retry timers while preserving packet-granularity round-robin fairness within and across requester/responder traffic classes.
-- Batched packet ownership APIs, bounded endpoint batch progress, batch WQE posting, batch receive posting, completion polling, and the fixed allocation-free test backend.
-- MTU segmentation/reassembly, positive ACKs, sequence/access/invalid-request NAKs, RNR NAKs, timeout and NAK retry scheduling, duplicate suppression, and RDMA READ response replay.
-- Two-endpoint deterministic tests for segmented SEND, WRITE followed by READ, RNR recovery, packet-loss timeout retransmission, injected loss/reorder/duplicate/corruption behavior, malformed and unrelated ingress containment, and remote-access failure, plus active-QP and requester/responder class fairness, multiple simultaneous deadline expiry, reset cancellation, and randomized scheduler-model differential tests.
-- Portable slicing-by-eight ICRC with differential checking against the bitwise reference path, plus direct registered-memory payload encoding into batch TX frames without an intermediate MTU payload copy.
-- AF_XDP configuration, frame-ownership, completion, NEED_WAKEUP, Ethernet framing, native XDP steering, and XSKMAP lifecycle tests, including VLAN/QinQ rejection and exact IPv4 length recovery from padded Ethernet frames.
+- `no_std`, allocation-free BTH, RETH, AETH, opcode, IPv4/UDP, packet, and ICRC codecs.
+- 24-bit PSN arithmetic, cumulative ACK windows, QP transitions, retry/RNR timing, segmentation, reassembly, and fixed rings.
+- Fixed-capacity memory registration with full-width lkey/rkey lookup, stale-key rejection, MR leases, access/range/overflow validation, and a small audited raw-memory boundary.
+- RC SEND, RDMA WRITE, and RDMA READ requester/responder execution with completions, ACK/NAK/RNR, retries, duplicate suppression, READ replay, and rollover coverage.
+- Fixed QPN indexing, requester/responder ready queues, and indexed deadline scheduling without QP-wide packet-path scans.
+- Batched packet ownership, batch endpoint progress, batch posting/polling, and the fixed allocation-free packet backend.
+- Allocation instrumentation that exercises SEND, WRITE, READ, ACK, retry, RNR, and completion paths and asserts zero steady-state allocation.
+- Allocation-free fault injection for loss, duplication, delay, reorder, and corruption.
+- Slicing-by-eight ICRC with a bitwise differential reference.
+- Linux raw IPv4 and AF_XDP packet backends.
+- AF_XDP UMEM, RX/TX/fill/completion rings, generation-checked frame ownership, NEED_WAKEUP, native XDP steering, XSKMAP lifecycle, and untagged Ethernet framing.
+- Cargo-fuzz targets for wire decode/roundtrip, memory-registry lifetimes, and RC event streams.
+- Miri, ASan, UBSan, deterministic fuzz-smoke, strict Clippy, MSRV, and whole-workspace no-std CI definitions.
+- A standalone libibverbs peer and a pure-Rust peer sharing a versioned connection record.
+- The Rust interoperability peer can use raw IPv4 or AF_XDP without linking libibverbs into the transport.
+- Automated RXE namespace setup and SEND/WRITE/READ matrices in both requester directions, including PSN rollover.
+- RXE netem fault, benchmark, and long-soak drivers.
+- Requester-side p50, p95, p99, and p99.9 latency output from both interoperability peers.
+- Power-of-two QPN shard planning, Linux CPU/NUMA placement discovery, and 100K-QP scale-plan tooling.
 
-## Implemented but not yet qualified as production-ready
+## Code present, external qualification still required
 
-- The Linux `afxdp` feature implements UMEM allocation/registration, RX/TX/fill/completion ring mappings, generation-checked frame ownership, `XDP_USE_NEED_WAKEUP`, explicit zero-copy/copy bind policy, untagged Ethernet framing, direct borrowed UMEM RX parsing, native XDP steering, XSKMAP registration, and fixed-capacity steady-state frame recycling.
-- The project-owned XDP path uses a native BPF link and redirects only eligible untagged IPv4 UDP/4791 traffic for queues with registered sockets. It has not yet been qualified on supported NICs, so hardware zero-copy behavior remains an external qualification gate.
-- The raw IPv4 backend exercises the complete transport but has not yet been certified against `rdma_rxe` on two Linux endpoints.
-- The steady-state design uses fixed storage, but allocator-instrumented tests still need to prove zero allocations across the normal packet path.
-- Parser/state-machine unit and property tests exist; long-running coverage-guided fuzz campaigns and corpus management are still required.
+The following gates require an environment that normal hosted CI does not provide:
 
-## Not yet complete
+- Run the complete Linux RXE SEND/WRITE/READ matrix in both directions.
+- Run the RXE loss, duplicate, delay, reorder, rollover, and long-soak campaigns.
+- Run sustained cargo-fuzz, Miri, ASan, and UBSan qualification and retain artifacts.
+- Run the privileged XDP verifier/attach path and AF_XDP dataplane on supported NIC queues.
+- Qualify AF_XDP zero-copy mode on each supported NIC/driver combination.
+- Qualify against physical RoCE RNICs and retain environment metadata and packet captures.
+- Run 1, 100, 1K, 10K, and 100K-QP scale tests on target hardware.
+- Run reproducible throughput, latency, CPU, cycles/packet, cycles/byte, cache, and allocation measurements.
+- Run 24, 48, and 72 hour soak campaigns.
 
-- Shared-UMEM policy, multi-buffer/scatter-gather support, UMEM-backed application buffers, and broader queue-placement helpers.
-- Automated Linux `rdma_rxe` SEND/WRITE/READ interoperability in both relevant directions, including loss, reorder, duplicate, rollover, malformed, and bad key/address cases.
-- Hardware qualification against NVIDIA/Mellanox, Intel, Broadcom, and other supported RoCE NICs.
-- Comparative RXE benchmarks for throughput, latency distribution, allocations/op, cycles/packet, CPU/byte, and cache behavior.
-- Per-core QP sharding, NUMA placement, and 100K-QP scale qualification.
+No passing result is claimed until the corresponding workload is executed against the exact release commit.
 
-The crate remains pre-1.0 until the interoperability, safety, fuzzing, zero-allocation, AF_XDP steering/qualification, and performance gates above are satisfied.
+## Initial release limits
+
+The first production release remains intentionally narrow:
+
+- IPv4 RoCEv2 Reliable Connected transport only.
+- SEND, RDMA WRITE, and RDMA READ.
+- One SGE per WQE.
+- Manual or authenticated out-of-band connection setup.
+- Outstanding RDMA READ depth one.
+- Untagged Ethernet in the AF_XDP backend.
+- One UMEM owned by one AF_XDP socket/queue.
+- One Ethernet frame per UMEM chunk.
+- No `XDP_USE_SG`, multi-buffer RX/TX, shared UMEM, VLAN/QinQ, RDMA-CM, atomics, multicast, SRQ, XRC, GPU Direct, or congestion-control implementation.
+
+With the default 4096-byte AF_XDP chunk, the complete IPv4 packet limit is 4082 bytes after the Ethernet header. A 4096-byte RoCE path MTU is therefore not supported by the current AF_XDP backend. Use a supported path MTU for AF_XDP qualification.
+
+The crate remains pre-1.0 until the external release gates in `docs/release-qualification.md` have passing evidence.
