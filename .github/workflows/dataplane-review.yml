@@ -46,22 +46,43 @@ jobs:
           git apply /tmp/dataplane.patch
           git rm .review/dataplane.patch
           cargo +stable fmt --all
+          cargo +1.85.0 generate-lockfile
           git diff --stat
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
           git commit -m 'feat: apply reviewed dataplane hardening checkpoint'
           git push origin HEAD:feat/dataplane-lifetime-hardening
-          echo "Validated source commit: $(git rev-parse HEAD)"
+          echo "Source commit under review: $(git rev-parse HEAD)"
       - name: Stable tests
         if: ${{ !cancelled() }}
-        run: cargo +stable test --workspace --all-features --all-targets
+        run: cargo +stable test --locked --workspace --all-features --all-targets
       - name: Strict Clippy
         if: ${{ !cancelled() }}
-        run: cargo +stable clippy --workspace --all-features --all-targets -- -D warnings
+        run: cargo +stable clippy --locked --workspace --all-features --all-targets -- -D warnings
       - name: Portable no_std workspace
         if: ${{ !cancelled() }}
-        run: cargo +stable check --workspace --no-default-features --target thumbv7em-none-eabihf
+        run: cargo +stable check --locked --workspace --no-default-features --target thumbv7em-none-eabihf
       - name: Rust 1.85 tests
         if: ${{ !cancelled() }}
-        run: cargo +1.85.0 test --workspace --all-features --all-targets
+        run: cargo +1.85.0 test --locked --workspace --all-features --all-targets
+      - name: Kernel XDP verifier and fallback
+        if: ${{ !cancelled() }}
+        run: |
+          cargo +stable test --locked -p rocev2-io --all-features --lib --no-run --message-format=json > /tmp/io-tests.json
+          python3 - <<'PY'
+          import json, subprocess
+          for line in open('/tmp/io-tests.json'):
+              message = json.loads(line)
+              if message.get('reason') == 'compiler-artifact' and message.get('executable') and message.get('profile', {}).get('test'):
+                  subprocess.run(['sudo', message['executable'], 'kernel_', '--ignored', '--nocapture', '--test-threads=1'], check=True)
+          PY
+      - name: Archive exact source under review
+        if: ${{ !cancelled() }}
+        run: git archive --format=tar -o /tmp/source.tar HEAD
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: reviewed-source
+          path: /tmp/source.tar
+          retention-days: 3
