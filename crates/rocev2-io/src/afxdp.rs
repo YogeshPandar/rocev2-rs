@@ -594,6 +594,18 @@ impl<T: Copy> ConsumerRing<T> {
     }
 }
 
+fn configure_socket_rings(descriptor: i32, config: AfxdpConfig) -> Result<(), AfxdpError> {
+    for (option, entries) in [
+        (libc::XDP_UMEM_FILL_RING, config.fill_ring_size),
+        (libc::XDP_UMEM_COMPLETION_RING, config.completion_ring_size),
+        (libc::XDP_RX_RING, config.rx_ring_size),
+        (libc::XDP_TX_RING, config.tx_ring_size),
+    ] {
+        configure_ring(descriptor, option, entries)?;
+    }
+    Ok(())
+}
+
 /// One queue-bound nonblocking Linux `AF_XDP` socket.
 ///
 /// Construction allocates and registers UMEM, maps all four `AF_XDP` rings,
@@ -633,26 +645,7 @@ impl AfxdpSocket {
         let descriptor = create_xdp_socket()?;
         let umem = Umem::new(config)?;
         register_umem(descriptor.as_raw_fd(), &umem)?;
-        configure_ring(
-            descriptor.as_raw_fd(),
-            libc::XDP_UMEM_FILL_RING,
-            config.fill_ring_size,
-        )?;
-        configure_ring(
-            descriptor.as_raw_fd(),
-            libc::XDP_UMEM_COMPLETION_RING,
-            config.completion_ring_size,
-        )?;
-        configure_ring(
-            descriptor.as_raw_fd(),
-            libc::XDP_RX_RING,
-            config.rx_ring_size,
-        )?;
-        configure_ring(
-            descriptor.as_raw_fd(),
-            libc::XDP_TX_RING,
-            config.tx_ring_size,
-        )?;
+        configure_socket_rings(descriptor.as_raw_fd(), config)?;
 
         let offsets = mmap_offsets(descriptor.as_raw_fd())?;
         let rx_ring = ConsumerRing::map(
