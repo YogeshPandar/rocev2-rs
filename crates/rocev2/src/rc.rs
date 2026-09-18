@@ -89,10 +89,14 @@ pub struct RcEndpointStats {
     pub transmit_bytes: u64,
     /// Packets rejected by strict IPv4/UDP/transport/ICRC validation.
     pub invalid_packets: u64,
+    /// Packets consumed and intentionally dropped as invalid or unrelated traffic.
+    pub dropped_packets: u64,
     /// Valid packets addressed to an unknown QPN.
     pub unknown_qp_packets: u64,
     /// Valid packets received from an address other than the connected peer.
     pub peer_mismatch_packets: u64,
+    /// Valid packets for a QP that is not currently able to receive.
+    pub qp_not_ready_packets: u64,
     /// Packet-backend failures.
     pub io_errors: u64,
     /// Send-queue work requests accepted from the application.
@@ -139,6 +143,13 @@ impl RcProgress {
             || self.completions != 0
             || self.retransmissions != 0
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReceiveOne<'a> {
+    Empty,
+    Dropped,
+    Packet(DecodedPacket<'a>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1079,17 +1090,24 @@ where
             return Ok(progress);
         }
 
-        if let Some(decoded) = self.receive_one(receive_buffer)? {
-            progress.received_packets = 1;
-            let result = self.process_incoming(now, decoded)?;
-            progress.completions += result.completions;
-            progress.retransmissions += result.retransmissions;
-            if let Some(reply) = result.reply {
-                let queued = self.pending_control.push(reply);
-                debug_assert!(queued.is_ok());
-                if self.transmit_pending_control(transmit_buffer)? {
-                    progress.transmitted_packets = 1;
-                    return Ok(progress);
+        match self.receive_one(receive_buffer)? {
+            ReceiveOne::Empty => {}
+            ReceiveOne::Dropped => {
+                progress.received_packets = 1;
+            }
+            ReceiveOne::Packet(decoded) => {
+                progress.received_packets = 1;
+                if let Some(result) = self.process_incoming(now, decoded)? {
+                    progress.completions += result.completions;
+                    progress.retransmissions += result.retransmissions;
+                    if let Some(reply) = result.reply {
+                        let queued = self.pending_control.push(reply);
+                        debug_assert!(queued.is_ok());
+                        if self.transmit_pending_control(transmit_buffer)? {
+                            progress.transmitted_packets = 1;
+                            return Ok(progress);
+                        }
+                    }
                 }
             }
         }
@@ -1159,29 +1177,28 @@ where
     fn receive_one<'buffer>(
         &mut self,
         buffer: &'buffer mut [u8],
-    ) -> Result<Option<DecodedPacket<'buffer>>, PollError<Io::Error>> {
+    ) -> Result<ReceiveOne<'buffer>, PollError<Io::Error>> {
         let length = match self.io.receive_ipv4(buffer) {
             Ok(Some(length)) => length,
-            Ok(None) => return Ok(None),
+            Ok(None) => return Ok(ReceiveOne::Empty),
             Err(error) => {
                 self.stats.io_errors = self.stats.io_errors.saturating_add(1);
                 return Err(PollError::Io(error));
             }
         };
-        if length > self.config.maximum_packet_size || length > buffer.len() {
-            self.stats.invalid_packets = self.stats.invalid_packets.saturating_add(1);
-            return Err(ApiError::PacketTooLarge {
-                length,
-                maximum: self.config.maximum_packet_size.min(buffer.len()),
-            }
-            .into());
+        if length > buffer.len() {
+            return Err(ApiError::PacketIoContractViolation.into());
+        }
+        if length > self.config.maximum_packet_size {
+            self.record_invalid_drop();
+            return Ok(ReceiveOne::Dropped);
         }
 
         let decoded = match decode_ipv4_packet(&buffer[..length]) {
             Ok(decoded) => decoded,
-            Err(error) => {
-                self.stats.invalid_packets = self.stats.invalid_packets.saturating_add(1);
-                return Err(PollError::Api(error));
+            Err(_) => {
+                self.record_invalid_drop();
+                return Ok(ReceiveOne::Dropped);
             }
         };
         self.stats.receive_packets = self.stats.receive_packets.saturating_add(1);
@@ -1189,15 +1206,20 @@ where
             .stats
             .receive_bytes
             .saturating_add(u64::try_from(length).unwrap_or(u64::MAX));
-        Ok(Some(decoded))
+        Ok(ReceiveOne::Packet(decoded))
+    }
+
+    fn record_invalid_drop(&mut self) {
+        self.stats.invalid_packets = self.stats.invalid_packets.saturating_add(1);
+        self.stats.dropped_packets = self.stats.dropped_packets.saturating_add(1);
     }
 
     fn process_incoming(
         &mut self,
         now: u64,
         decoded: DecodedPacket<'_>,
-    ) -> Result<HandlerResult, ApiError> {
-        let (index, result) = process_incoming_state(
+    ) -> Result<Option<HandlerResult>, ApiError> {
+        let state = process_incoming_state(
             &self.qpn_index,
             &mut self.qps,
             &mut self.memory,
@@ -1205,13 +1227,22 @@ where
             self.config.ticks_per_second,
             now,
             decoded,
-        )?;
+        );
+        let (index, result) = match state {
+            Ok(value) => value,
+            Err(
+                ApiError::UnknownDestinationQpn(_)
+                | ApiError::PeerAddressMismatch { .. }
+                | ApiError::QpNotReady(_),
+            ) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         self.synchronize_qp(index);
         self.stats.completions = self
             .stats
             .completions
             .saturating_add(u64::try_from(result.completions).unwrap_or(u64::MAX));
-        Ok(result)
+        Ok(Some(result))
     }
 
     fn transmit_pending_control(
@@ -1949,23 +1980,16 @@ where
                     break;
                 }
             };
+            progress.received_packets = progress.received_packets.saturating_add(1);
             if packet.len() > self.config.maximum_packet_size {
-                self.stats.invalid_packets = self.stats.invalid_packets.saturating_add(1);
-                processing_error = Some(
-                    ApiError::PacketTooLarge {
-                        length: packet.len(),
-                        maximum: self.config.maximum_packet_size,
-                    }
-                    .into(),
-                );
-                break;
+                self.record_invalid_drop();
+                continue;
             }
             let decoded = match decode_ipv4_packet(packet) {
                 Ok(decoded) => decoded,
-                Err(error) => {
-                    self.stats.invalid_packets = self.stats.invalid_packets.saturating_add(1);
-                    processing_error = Some(PollError::Api(error));
-                    break;
+                Err(_) => {
+                    self.record_invalid_drop();
+                    continue;
                 }
             };
             let packet_length = packet.len();
@@ -1986,6 +2010,11 @@ where
             );
             let (index, result) = match state_result {
                 Ok(result) => result,
+                Err(
+                    ApiError::UnknownDestinationQpn(_)
+                    | ApiError::PeerAddressMismatch { .. }
+                    | ApiError::QpNotReady(_),
+                ) => continue,
                 Err(error) => {
                     processing_error = Some(PollError::Api(error));
                     break;
@@ -1996,7 +2025,6 @@ where
                 .stats
                 .completions
                 .saturating_add(u64::try_from(result.completions).unwrap_or(u64::MAX));
-            progress.received_packets = progress.received_packets.saturating_add(1);
             progress.completions = progress.completions.saturating_add(result.completions);
             progress.retransmissions = progress
                 .retransmissions
@@ -2342,6 +2370,7 @@ fn process_incoming_state<
     let destination_qpn = decoded.transport.bth.destination_qpn;
     let Some(index) = qpn_slot(qpn_index, destination_qpn) else {
         stats.unknown_qp_packets = stats.unknown_qp_packets.saturating_add(1);
+        stats.dropped_packets = stats.dropped_packets.saturating_add(1);
         return Err(ApiError::UnknownDestinationQpn(destination_qpn));
     };
 
@@ -2352,12 +2381,15 @@ fn process_incoming_state<
     if decoded.ipv4.source != slot.path.destination || decoded.ipv4.destination != slot.path.source
     {
         stats.peer_mismatch_packets = stats.peer_mismatch_packets.saturating_add(1);
+        stats.dropped_packets = stats.dropped_packets.saturating_add(1);
         return Err(ApiError::PeerAddressMismatch {
             source: decoded.ipv4.source,
             destination: decoded.ipv4.destination,
         });
     }
     if !slot.machine.can_receive() {
+        stats.qp_not_ready_packets = stats.qp_not_ready_packets.saturating_add(1);
+        stats.dropped_packets = stats.dropped_packets.saturating_add(1);
         return Err(ApiError::QpNotReady(slot.machine.state()));
     }
 
