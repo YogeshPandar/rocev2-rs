@@ -363,7 +363,12 @@ fn wait_done_while_progressing(
                     "control peer closed",
                 ));
             }
-            Ok(_) => break Err(io::Error::new(io::ErrorKind::InvalidData, "invalid control read")),
+            Ok(_) => {
+                break Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid control read",
+                ));
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => break Err(error),
         }
