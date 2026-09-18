@@ -102,7 +102,10 @@ impl FaultRule {
         if self.remaining == 0 || self.direction != direction {
             return false;
         }
-        if self.packet_number.is_some_and(|value| value != packet_number) {
+        if self
+            .packet_number
+            .is_some_and(|value| value != packet_number)
+        {
             return false;
         }
         if self.opcode.is_none() && self.qpn.is_none() && self.psn.is_none() {
@@ -178,7 +181,10 @@ impl<E: fmt::Display> fmt::Display for FaultInjectError<E> {
         match self {
             Self::Inner(error) => write!(formatter, "wrapped packet I/O failed: {error}"),
             Self::PacketTooLarge { length, maximum } => {
-                write!(formatter, "packet length {length} exceeds fault buffer {maximum}")
+                write!(
+                    formatter,
+                    "packet length {length} exceeds fault buffer {maximum}"
+                )
             }
             Self::OutputTooSmall {
                 required,
@@ -638,8 +644,7 @@ mod tests {
         inner.inject_receive(&second).unwrap();
         let mut io = FaultInjectIo::<_, 4, 64>::new(inner);
         io.push_rule(
-            FaultRule::new(FaultAction::Duplicate, FaultDirection::Receive)
-                .packet_number(1),
+            FaultRule::new(FaultAction::Duplicate, FaultDirection::Receive).packet_number(1),
         )
         .unwrap();
 
@@ -653,11 +658,8 @@ mod tests {
         assert_eq!(io.statistics().duplicated, 1);
 
         io.inner_mut().inject_receive(&first).unwrap();
-        io.push_rule(
-            FaultRule::new(FaultAction::Delay, FaultDirection::Receive)
-                .packet_number(3),
-        )
-        .unwrap();
+        io.push_rule(FaultRule::new(FaultAction::Delay, FaultDirection::Receive).packet_number(3))
+            .unwrap();
         assert_eq!(io.receive_ipv4(&mut output).unwrap(), None);
         assert_eq!(io.receive_ipv4(&mut output).unwrap(), Some(44));
         assert_eq!(packet_identity(&output[..44]).unwrap().psn, 1);
