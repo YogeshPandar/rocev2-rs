@@ -600,6 +600,45 @@ impl<'a, const N: usize> MemoryRegistry<'a, N> {
         .map(|_| ())
     }
 
+    /// Borrow a locally registered source after validating its lkey and range.
+    ///
+    /// the returned slice is tied to this registry borrow, so safe code cannot
+    /// mutate registered memory until the borrow ends.
+    pub fn local_read_slice(
+        &self,
+        lkey: u32,
+        address: u64,
+        length: usize,
+    ) -> Result<&[u8], MemoryError> {
+        let (pointer, offset) =
+            self.resolve(lkey, KeyKind::Local, AccessFlags::NONE, address, length)?;
+        // SAFETY: resolve validated the live allocation and requested range.
+        // the shared registry borrow prevents mutation for the returned lifetime.
+        Ok(unsafe { raw::slice_from_registered(pointer, offset, length) })
+    }
+
+    /// Borrow a remotely readable source after validating rkey and permission.
+    ///
+    /// the returned slice is tied to this registry borrow, so safe code cannot
+    /// mutate registered memory until the borrow ends.
+    pub fn remote_read_slice(
+        &self,
+        rkey: u32,
+        address: u64,
+        length: usize,
+    ) -> Result<&[u8], MemoryError> {
+        let (pointer, offset) = self.resolve(
+            rkey,
+            KeyKind::Remote,
+            AccessFlags::REMOTE_READ,
+            address,
+            length,
+        )?;
+        // SAFETY: resolve validated the live allocation, permission, and range.
+        // the shared registry borrow prevents mutation for the returned lifetime.
+        Ok(unsafe { raw::slice_from_registered(pointer, offset, length) })
+    }
+
     /// Copy from a locally registered source after validating its lkey.
     pub fn read_local(
         &mut self,
@@ -771,6 +810,32 @@ mod tests {
             );
         }
         assert_eq!(&memory[4..7], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn borrowed_read_ranges_are_checked_and_zero_copy() {
+        let mut memory = *b"abcdefgh";
+        let mut registry = MemoryRegistry::<1>::new(5).unwrap();
+        let region = registry
+            .register(&mut memory, AccessFlags::REMOTE_READ)
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .local_read_slice(region.lkey(), region.address() + 2, 3)
+                .unwrap(),
+            b"cde"
+        );
+        assert_eq!(
+            registry
+                .remote_read_slice(region.rkey(), region.address() + 5, 3)
+                .unwrap(),
+            b"fgh"
+        );
+        assert_eq!(
+            registry.remote_read_slice(region.rkey(), region.address() + 7, 2),
+            Err(MemoryError::RangeOutOfBounds)
+        );
     }
 
     #[test]
