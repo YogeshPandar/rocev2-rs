@@ -1,0 +1,55 @@
+name: rxe-interoperability
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Qualification suite: clean, fault, or benchmark"
+        required: false
+        default: "clean"
+      sizes:
+        description: Space-separated payload sizes
+        required: false
+        default: "0 1 255 256 257 1023 1024 1025 4096 65536 1048576"
+      mtus:
+        description: Space-separated path MTUs
+        required: false
+        default: "256 512 1024 2048 4096"
+      iterations:
+        description: Iterations per matrix case
+        required: false
+        default: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rxe-interoperability
+  cancel-in-progress: false
+
+jobs:
+  rxe:
+    runs-on: [self-hosted, linux, x64, rocev2-rxe]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: Build peers
+        run: interop/scripts/build-peers.sh
+      - name: Run RXE qualification
+        env:
+          ROCEV2_SIZES: ${{ inputs.sizes }}
+          ROCEV2_MTUS: ${{ inputs.mtus }}
+          ROCEV2_ITERATIONS: ${{ inputs.iterations }}
+        run: |
+          case "${{ inputs.suite }}" in
+            clean) sudo -E interop/scripts/rxe-matrix.sh ;;
+            fault) sudo -E interop/scripts/rxe-fault-matrix.sh ;;
+            benchmark) sudo -E interop/scripts/rxe-benchmark.sh ;;
+            *) echo "unknown suite: ${{ inputs.suite }}" >&2; exit 2 ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: rxe-interoperability-${{ github.sha }}
+          path: interop/results

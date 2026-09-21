@@ -21,9 +21,11 @@ impl Reth {
             });
         }
         Ok(Self {
-            virtual_address: u64::from_be_bytes(input[0..8].try_into().expect("slice length")),
-            remote_key: u32::from_be_bytes(input[8..12].try_into().expect("slice length")),
-            dma_length: u32::from_be_bytes(input[12..16].try_into().expect("slice length")),
+            virtual_address: u64::from_be_bytes([
+                input[0], input[1], input[2], input[3], input[4], input[5], input[6], input[7],
+            ]),
+            remote_key: u32::from_be_bytes([input[8], input[9], input[10], input[11]]),
+            dma_length: u32::from_be_bytes([input[12], input[13], input[14], input[15]]),
         })
     }
 

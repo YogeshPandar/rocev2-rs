@@ -95,7 +95,7 @@ impl Aeth {
                 actual: input.len(),
             });
         }
-        let raw = u32::from_be_bytes(input[0..4].try_into().expect("slice length"));
+        let raw = u32::from_be_bytes([input[0], input[1], input[2], input[3]]);
         Ok(Self {
             syndrome: (raw >> 24) as u8,
             message_sequence_number: raw & PSN_MASK,

@@ -22,7 +22,9 @@ mod entropy;
 #[cfg(all(feature = "placement", target_os = "linux"))]
 mod placement;
 #[cfg(all(feature = "placement", target_os = "linux"))]
-pub use placement::{NumaTopology, allowed_cpus, parse_cpu_list, pin_current_thread};
+pub use placement::{
+    NumaTopology, WorkerPlacement, allowed_cpus, parse_cpu_list, pin_current_thread, plan_workers,
+};
 mod ethernet;
 mod fault;
 mod fixed;

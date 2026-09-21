@@ -5,13 +5,12 @@ The data path implements the transport itself; it does not forward SEND, RDMA
 WRITE, or RDMA READ operations to libibverbs, librdmacm, UCX, rdma-core, or
 Linux RXE.
 
-> **Status: pre-1.0 engineering preview.** A fixed-capacity RC execution engine
-> posts and executes SEND, WRITE, and READ in deterministic software tests,
-> including completions, segmentation, ACK/NAK/RNR, duplicate suppression, and
-> retry scheduling. AF_XDP UMEM/rings, completion ownership, native XDP steering,
-> and XSKMAP lifecycle are implemented. Linux RXE and hardware-RNIC
-> interoperability, sustained fuzzing, and performance qualification remain
-> release blockers. Do not expose untrusted memory or production traffic yet.
+> **Status: pre-1.0 qualification candidate.** The narrow IPv4 RC transport,
+> fixed-capacity scheduling/memory model, batched packet path, AF_XDP backend,
+> zero-allocation verification, fuzz/safety targets, interoperability peers,
+> RXE fault/benchmark/soak harnesses, and scale/NUMA tooling are implemented.
+> Release still requires executed RXE, RNIC, AF_XDP, sustained safety, scale,
+> performance, and long-soak evidence on the exact release commit.
 
 ## Workspace
 
@@ -150,9 +149,10 @@ produce a sequence NAK. RDMA READ reserves the complete response PSN span before
 the request is transmitted.
 
 See [implementation status](docs/status.md), [architecture](docs/architecture.md),
-[AF_XDP backend](docs/afxdp.md), and [protocol sources](docs/protocol-sources.md)
-for the current qualification boundary and the primary references used by the
-implementation.
+[AF_XDP backend](docs/afxdp.md), [qualification tooling](docs/qualification.md),
+[release qualification](docs/release-qualification.md), and
+[protocol sources](docs/protocol-sources.md) for the current release boundary
+and the primary references used by the implementation.
 
 ## Validation
 

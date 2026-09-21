@@ -339,10 +339,9 @@ impl<const SQ: usize, const RQ: usize, const CQ: usize> RcQpSlot<SQ, RQ, CQ> {
         debug_assert!(self.completion_reservations != 0);
         self.completion_reservations = self.completion_reservations.saturating_sub(1);
         if let Some(completion) = completion {
-            self.completion_queue
-                .push(completion)
-                .expect("a reserved completion slot must be available");
-            1
+            let pushed = self.completion_queue.push(completion).is_ok();
+            debug_assert!(pushed, "reserved completion capacity must be available");
+            usize::from(pushed)
         } else {
             0
         }
@@ -2567,8 +2566,11 @@ fn start_next_request<const SQ: usize, const RQ: usize, const CQ: usize>(
         return;
     };
     let timeout_ticks = ack_timeout_ticks(config.timeout, ticks_per_second).unwrap_or(u64::MAX);
-    let policy = RetryPolicy::new(config.retry_count, config.rnr_retry_count, timeout_ticks)
-        .expect("validated QP retry counts");
+    let Some(policy) = RetryPolicy::new(config.retry_count, config.rnr_retry_count, timeout_ticks)
+    else {
+        debug_assert!(false, "QP retry counts must be validated");
+        return;
+    };
     let Some(posted) = slot.send_queue.pop() else {
         return;
     };

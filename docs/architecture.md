@@ -23,6 +23,13 @@ A polling thread owns its endpoint and QP shard. There is no mutex, task per QP,
 or channel in the packet path. Work queues, completion queues, packet buffers and
 QP tables are fixed-capacity and allocated at endpoint construction.
 
+`QpnShardPlan` partitions the 24-bit application QPN space across a power-of-two
+number of independent owners. `plan_workers` combines Linux RX queue discovery,
+the process CPU affinity mask, and the NIC NUMA-local CPU list to produce stable
+queue/core placement. The control plane creates one endpoint and packet-I/O
+queue per owner. Normal packet execution does not cross shard ownership and does
+not require a global QP lock or a shared packet queue.
+
 Each shard uses a fixed open-addressed QPN index to map the destination QPN to
 its QP slot. The index is kept at or below 50 percent load, uses contiguous
 linear probing, and removes entries with backward shifting so QP churn does not
